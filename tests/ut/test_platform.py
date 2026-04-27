@@ -12,6 +12,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
+    AWQ_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
     AscendDeviceType,
 )
@@ -64,7 +65,7 @@ class TestNPUPlatform(TestBase):
         self._enable_sp_patch = patch("vllm_ascend.utils.enable_sp", return_value=False)
         self._enable_sp_patch.start()
         self.platform = NPUPlatform()
-        self.platform.supported_quantization[:] = ["ascend", "compressed-tensors"]
+        self.platform.supported_quantization[:] = ["ascend", "awq", "compressed-tensors"]
 
     def tearDown(self):
         self._enable_sp_patch.stop()
@@ -77,7 +78,10 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.ray_device_key, "NPU")
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
-        self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+        self.assertEqual(
+            NPUPlatform.supported_quantization,
+            [ASCEND_QUANTIZATION_METHOD, AWQ_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD],
+        )
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
@@ -96,6 +100,42 @@ class TestNPUPlatform(TestBase):
 
         self.assertTrue(ASCEND_QUANTIZATION_METHOD in mock_action.choices)
         self.assertEqual(len(mock_action.choices), 3)  # original 2 + ascend
+
+    @patch("vllm_ascend.utils.adapt_patch")
+    @patch("vllm_ascend.quantization.awq_config.AscendAWQConfig")
+    @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
+    def test_pre_register_and_update_adds_awq_when_missing(self, mock_quant_config, mock_awq_config, mock_adapt_patch):
+        mock_parser = MagicMock()
+        mock_action = MagicMock()
+        mock_action.choices = ["gptq"]
+        mock_parser._option_string_actions = {"--quantization": mock_action}
+
+        self.platform.pre_register_and_update(mock_parser)
+
+        mock_adapt_patch.assert_called_once_with(is_global_patch=True)
+        self.assertIn(ASCEND_QUANTIZATION_METHOD, mock_action.choices)
+        self.assertIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
+
+    @patch("vllm_ascend.platform.is_310p", return_value=True)
+    @patch("vllm_ascend.utils.adapt_patch")
+    @patch("vllm_ascend.quantization.awq_config.AscendAWQConfig")
+    @patch("vllm_ascend._310p.quantization.AscendModelSlimConfig310")
+    def test_pre_register_and_update_imports_awq_on_310p(
+        self,
+        mock_quant_config,
+        mock_awq_config,
+        mock_adapt_patch,
+        mock_is_310p,
+    ):
+        mock_parser = MagicMock()
+        mock_action = MagicMock()
+        mock_action.choices = ["gptq"]
+        mock_parser._option_string_actions = {"--quantization": mock_action}
+
+        self.platform.pre_register_and_update(mock_parser)
+
+        mock_adapt_patch.assert_called_once_with(is_global_patch=True)
+        self.assertIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")

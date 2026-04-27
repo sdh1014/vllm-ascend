@@ -30,6 +30,7 @@ Usage:
 from typing import Any
 
 # Import base classes
+from .awq import AscendAWQLinearMethod
 from .base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, QuantType
 
 # Import all scheme classes for external access
@@ -79,6 +80,7 @@ __all__ = [
     "is_mx_quant_type",
     # Scheme classes
     "AscendW8A8LinearMethod",
+    "AscendAWQLinearMethod",
     "AscendW8A8DynamicLinearMethod",
     "AscendW8A8DynamicFusedMoEMethod",
     "AscendW8A8FP8DynamicLinearMethod",
