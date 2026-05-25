@@ -140,6 +140,10 @@ class BlockTable:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if not hasattr(_compute_slot_mapping_kernel, "__getitem__"):
+            self._compute_slot_mapping_torch(num_reqs, query_start_loc, positions)
+            return
+
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
@@ -165,6 +169,53 @@ class BlockTable:
                 PAD_ID=PAD_SLOT_ID,
                 BLOCK_SIZE=1024,
             )
+
+    def _compute_slot_mapping_torch(
+        self,
+        num_reqs: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        num_tokens = positions.shape[0]
+        slot_mapping = self.slot_mapping.gpu
+        slot_mapping[num_tokens : self.max_num_batched_tokens] = PAD_SLOT_ID
+
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        virtual_block_size = self.block_size * total_cp_world_size
+
+        for req_idx in range(num_reqs):
+            start_idx = int(query_start_loc[req_idx].item())
+            end_idx = int(query_start_loc[req_idx + 1].item())
+            if start_idx == end_idx:
+                continue
+
+            req_positions = positions[start_idx:end_idx]
+            block_indices = torch.div(req_positions, virtual_block_size, rounding_mode="floor").to(torch.long)
+            block_numbers = self.block_table.gpu[req_idx].index_select(0, block_indices).to(torch.long)
+
+            virtual_block_offsets = req_positions - block_indices * virtual_block_size
+            is_local = (
+                torch.div(virtual_block_offsets, self.cp_kv_cache_interleave_size, rounding_mode="floor")
+                % total_cp_world_size
+            ) == total_cp_rank
+            local_block_offsets = (
+                torch.div(
+                    virtual_block_offsets,
+                    total_cp_world_size * self.cp_kv_cache_interleave_size,
+                    rounding_mode="floor",
+                )
+                * self.cp_kv_cache_interleave_size
+                + virtual_block_offsets % self.cp_kv_cache_interleave_size
+            )
+
+            slot_ids = block_numbers * self.block_size + local_block_offsets
+            slot_ids = torch.where(
+                is_local,
+                slot_ids,
+                torch.full_like(slot_ids, PAD_SLOT_ID),
+            )
+            slot_mapping[start_idx:end_idx] = slot_ids.to(slot_mapping.dtype)
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]

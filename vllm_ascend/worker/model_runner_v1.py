@@ -18,6 +18,7 @@
 #
 
 import gc
+import inspect
 import math
 import sys
 import time
@@ -124,16 +125,26 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
-from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
-from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
-from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
-    AscendExtractHiddenStatesProposer,
-)
-from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
-from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
-from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
-from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+try:
+    from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+    from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+    from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+    from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
+        AscendExtractHiddenStatesProposer,
+    )
+    from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+    from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
+    from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+    from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+except ModuleNotFoundError:
+    AscendDflashProposer = type("AscendDflashProposer", (), {})
+    AscendDraftModelProposer = type("AscendDraftModelProposer", (), {})
+    AscendEagleProposer = type("AscendEagleProposer", (), {})
+    AscendExtractHiddenStatesProposer = type("AscendExtractHiddenStatesProposer", (), {})
+    AscendMedusaProposer = type("AscendMedusaProposer", (), {})
+    AscendNgramProposer = type("AscendNgramProposer", (), {})
+    AscendNgramProposerNPU = type("AscendNgramProposerNPU", (), {})
+    AscendSuffixDecodingProposer = type("AscendSuffixDecodingProposer", (), {})
 from vllm_ascend.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -2456,17 +2467,21 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
 
+        model_runner_output_kwargs = {
+            "req_ids": req_ids_output_copy,
+            "req_id_to_index": req_id_to_index_output_copy,
+            "sampled_token_ids": valid_sampled_token_ids,
+            "logprobs": logprobs_lists,
+            "prompt_logprobs_dict": prompt_logprobs_dict,
+            "kv_connector_output": kv_connector_output,
+            "pooler_output": [],
+            "ec_connector_output": ec_connector_output if self.supports_mm_inputs else None,
+            "cudagraph_stats": cudagraph_stats,
+            "routed_experts": routed_experts_lists,
+        }
+        output_params = inspect.signature(ModelRunnerOutput).parameters
         model_runner_output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            kv_connector_output=kv_connector_output,
-            pooler_output=[],
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-            cudagraph_stats=cudagraph_stats,
-            routed_experts=routed_experts_lists,
+            **{name: value for name, value in model_runner_output_kwargs.items() if name in output_params}
         )
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
             self._sync_device()

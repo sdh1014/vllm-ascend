@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+import inspect
 import signal
 import time
 
@@ -45,16 +46,19 @@ class BalanceScheduler(Scheduler):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
-        super().__init__(
-            vllm_config,
-            kv_cache_config,
-            structured_output_manager,
-            block_size,
-            hash_block_size,
-            mm_registry,
-            include_finished_set,
-            log_stats,
-        )
+        scheduler_params = inspect.signature(_ORIGINAL_SCHEDULER.__init__).parameters
+        scheduler_kwargs = {
+            "vllm_config": vllm_config,
+            "kv_cache_config": kv_cache_config,
+            "structured_output_manager": structured_output_manager,
+            "block_size": block_size,
+            "hash_block_size": hash_block_size,
+            "mm_registry": mm_registry,
+            "include_finished_set": include_finished_set,
+            "log_stats": log_stats,
+        }
+        scheduler_kwargs = {name: value for name, value in scheduler_kwargs.items() if name in scheduler_params}
+        super().__init__(**scheduler_kwargs)
         self._balance_enabled = _balance_scheduling_enabled(vllm_config)
         if self._balance_enabled:
             self.balance_queue = [
