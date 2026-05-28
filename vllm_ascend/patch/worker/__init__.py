@@ -15,12 +15,22 @@
 # limitations under the License.
 #
 
+from importlib import util
+
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.utils import is_310p, vllm_version_is
 
 # v2 model runner is only supported on vllm > 0.20.2.
 _V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is("0.20.2")
+_DEEPSEEK_COMPRESSOR_SUPPORTED = all(
+    util.find_spec(module_name) is not None
+    for module_name in (
+        "vllm.model_executor.layers.deepseek_compressor",
+        "vllm.model_executor.layers.deepseek_v4_attention",
+        "vllm.v1.attention.backends.mla.sparse_swa",
+    )
+)
 
 if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
@@ -35,7 +45,9 @@ import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
 import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
 import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_next_mtp  # noqa
-import vllm_ascend.patch.worker.patch_deepseek_compressor  # noqa
+
+if _DEEPSEEK_COMPRESSOR_SUPPORTED:
+    import vllm_ascend.patch.worker.patch_deepseek_compressor  # noqa
 
 if not is_310p():
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa

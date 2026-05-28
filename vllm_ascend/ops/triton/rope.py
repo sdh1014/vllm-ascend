@@ -19,6 +19,18 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
+LARGE_ROPE_DIM_THRESHOLD = 256
+SMALL_NEOX_BLOCK_SIZE_HEAD = 16
+SMALL_GPTJ_BLOCK_SIZE_HEAD = 16
+DEFAULT_NEOX_BLOCK_SIZE_HEAD = 64
+DEFAULT_GPTJ_BLOCK_SIZE_HEAD = 32
+
+
+def _get_block_size_head(is_neox_style: bool, rope_dim: int) -> int:
+    if rope_dim >= LARGE_ROPE_DIM_THRESHOLD:
+        return SMALL_NEOX_BLOCK_SIZE_HEAD if is_neox_style else SMALL_GPTJ_BLOCK_SIZE_HEAD
+    return DEFAULT_NEOX_BLOCK_SIZE_HEAD if is_neox_style else DEFAULT_GPTJ_BLOCK_SIZE_HEAD
+
 
 @triton.jit
 def _triton_rope(
@@ -270,11 +282,7 @@ def rope_forward_triton(
 
     num_tokens, n_q_head, head_dim = q.shape
     n_kv_head = k.shape[1]
-    # TODO: use a more robust method to get BLOCK_SIZE_HEAD
-    if is_neox_style:
-        BLOCK_SIZE_HEAD = 64
-    else:
-        BLOCK_SIZE_HEAD = 32
+    BLOCK_SIZE_HEAD = _get_block_size_head(is_neox_style, rope_dim)
     num_vectorcore = get_vectorcore_num()
     n_row = min(num_tokens, num_vectorcore)
 

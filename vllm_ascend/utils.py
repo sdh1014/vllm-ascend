@@ -25,6 +25,7 @@ import os
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
+from importlib import util as importlib_util
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -46,6 +47,7 @@ else:
 COMPILATION_PASS_KEY = "graph_fusion_manager"
 ASCEND_QUANTIZATION_METHOD = "ascend"
 COMPRESSED_TENSORS_METHOD = "compressed-tensors"
+GGUF_QUANTIZATION_METHOD = "gguf"
 SOC_VERSION_INFERENCE_SERIES = ["Ascend310P3"]
 REGISTERED_ASCEND_OPS = {}
 
@@ -712,13 +714,13 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     global _ASCEND_CUSTOMOP_IS_REIGISTERED
     if _ASCEND_CUSTOMOP_IS_REIGISTERED:
         return
+    gdn_supported = importlib_util.find_spec("vllm.model_executor.layers.mamba.gdn_linear_attn") is not None
     from vllm.model_executor.custom_op import CustomOp
 
     from vllm_ascend.ops.activation import AscendQuickGELU, AscendSiluAndMul
     from vllm_ascend.ops.bailing_moe_linear_attn import AscendBailingMoELinearAttention
     from vllm_ascend.ops.conv import AscendConv3dLayer
     from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
-    from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
     from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
@@ -770,16 +772,19 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "Conv3dLayer": AscendConv3dLayer,
         "RelPosAttention": AscendRelPosAttention,
         "CustomQwen2Decoder": AscendCustomQwen2Decoder,
-        "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "BailingMoELinearAttention": AscendBailingMoELinearAttention,
     }
+
+    if gdn_supported:
+        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
 
     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
     if is_310p():
         from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
         from vllm_ascend._310p.ops.activation import AscendSiluAndMul310
         from vllm_ascend._310p.ops.conv import AscendConv3dLayer310
-        from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
         from vllm_ascend._310p.ops.layernorm import (
             AscendGemmaRMSNorm310,
             AscendRMSNorm310,
@@ -804,10 +809,14 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "VocabParallelEmbedding": AscendVocabParallelEmbedding310,
                 "MMEncoderAttention": AscendMMEncoderAttention310,
                 "Conv3dLayer": AscendConv3dLayer310,
-                "GatedDeltaNetAttention": AscendGatedDeltaNetAttention310,
                 "MRotaryEmbedding": AscendMRotaryEmbedding310,
             }
         )
+
+        if gdn_supported:
+            from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
+
+            REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention310
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)

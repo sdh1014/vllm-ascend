@@ -18,23 +18,12 @@ This feature is built on vLLM's `OffloadingConnector` framework and provides an 
 
 ```python
 from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
-
-kv_transfer_config = KVTransferConfig(
-    kv_connector="OffloadingConnector",
-    kv_role="kv_both",
-    kv_connector_extra_config={
-        "num_cpu_blocks": 1000,
-        "block_size": 128,
-        "spec_name": "NPUOffloadingSpec",
-        "spec_module_path": "vllm_ascend.kv_offload.npu",
-    },
-)
 
 llm = LLM(
     model="Qwen/Qwen3-0.6B",
     gpu_memory_utilization=0.5,
-    kv_transfer_config=kv_transfer_config,
+    kv_offloading_backend="native",
+    kv_offloading_size=8,
 )
 
 sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
@@ -49,26 +38,14 @@ for output in outputs:
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
     --gpu-memory-utilization 0.5 \
-    --kv-transfer-config '{
-        "kv_connector": "OffloadingConnector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": {
-            "num_cpu_blocks": 1000,
-            "block_size": 128,
-            "spec_name": "NPUOffloadingSpec",
-            "spec_module_path": "vllm_ascend.kv_offload.npu"
-        }
-    }'
+    --kv-offloading-backend native \
+    --kv-offloading-size 8
 ```
 
 ## Configuration Parameters
 
-- `kv_connector`: Must be set to `"OffloadingConnector"`.
-- `kv_role`: Set to `"kv_both"` to enable both storing and loading of KV cache.
-- `num_cpu_blocks`: Number of blocks to allocate in CPU memory. Increase this value for longer context scenarios. Each block consumes memory proportional to `block_size × num_layers × (key_size + value_size)`.
-- `block_size`: The CPU-side block size. Should be a multiple of the NPU-side block size. Typical value: `128`.
-- `spec_name`: Must be `"NPUOffloadingSpec"` for Ascend NPU.
-- `spec_module_path`: Must be `"vllm_ascend.kv_offload.npu"`.
+- `kv_offloading_backend`: Set to `"native"`.
+- `kv_offloading_size`: CPU memory size in GiB for native KV cache offload.
 
 ## How It Works
 
@@ -94,7 +71,8 @@ kv_events_config = KVEventsConfig(
 llm = LLM(
     model="Qwen/Qwen3-0.6B",
     gpu_memory_utilization=0.5,
-    kv_transfer_config=kv_transfer_config,
+    kv_offloading_backend="native",
+    kv_offloading_size=8,
     kv_events_config=kv_events_config,
 )
 ```
@@ -102,7 +80,7 @@ llm = LLM(
 ## Notes
 
 - This feature requires vLLM v1 engine.
-- Adjust `num_cpu_blocks` based on available CPU memory. Using too many blocks may cause out-of-memory errors on the host.
+- Adjust `kv_offloading_size` based on available CPU memory. Using too much CPU memory may cause out-of-memory errors on the host.
 - Pinned (page-locked) memory is used when available for optimal transfer performance.
 - The `gpu_memory_utilization` parameter controls how much NPU memory is reserved for KV cache. Lower values leave less NPU memory for KV cache, making offloading more active.
-- For production workloads, benchmark with realistic request patterns to find the optimal `num_cpu_blocks` and `block_size` settings.
+- For production workloads, benchmark with realistic request patterns to find the optimal `kv_offloading_size` setting.

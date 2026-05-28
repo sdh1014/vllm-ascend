@@ -40,6 +40,7 @@ from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
+    GGUF_QUANTIZATION_METHOD,
     AscendDeviceType,
     bootstrap_custom_op_env,
     check_kv_extra_config,
@@ -103,7 +104,11 @@ class NPUPlatform(Platform):
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
     dispatch_key: str = "PrivateUse1"
 
-    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD]
+    supported_quantization: list[str] = [
+        ASCEND_QUANTIZATION_METHOD,
+        COMPRESSED_TENSORS_METHOD,
+        GGUF_QUANTIZATION_METHOD,
+    ]
 
     def is_sleep_mode_available(self) -> bool:
         return True
@@ -140,18 +145,23 @@ class NPUPlatform(Platform):
 
         adapt_patch(is_global_patch=True)
 
-        # For online serving, "ascend" quantization method is not a choice natively,
-        # so we need to add "ascend" quantization method to quantization methods list
-        # and the user can enable quantization using "vllm serve --quantization ascend".
+        # Add Ascend-owned quantization choices for online serving.  GGUF is an
+        # upstream method, but it still needs to pass platform choice filtering.
         if parser is not None:
             quant_action = parser._option_string_actions.get("--quantization")
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
-                if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
-                    quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+                for quant_method in (ASCEND_QUANTIZATION_METHOD, GGUF_QUANTIZATION_METHOD):
+                    if quant_method not in quant_action.choices:
+                        quant_action.choices.append(quant_method)
 
         if not is_310p():
-            from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization import (  # noqa: F401
+                AscendCompressedTensorsConfig,
+                AscendGGUFConfig,
+                AscendModelSlimConfig,
+            )
         else:
+            from vllm_ascend.quantization import AscendGGUFConfig  # noqa: F401
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 
         config_deprecated_logging()
@@ -273,6 +283,33 @@ class NPUPlatform(Platform):
             raise ValueError("additional_config.layer_sharding can only be enabled in PD-disaggregated's P node.")
 
     @classmethod
+    def _set_native_kv_offload_spec(cls, vllm_config: VllmConfig) -> None:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return
+        if kv_transfer_config.kv_connector != "OffloadingConnector":
+            return
+
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        if "cpu_bytes_to_use" not in extra_config:
+            return
+
+        extra_config.setdefault("spec_name", "NPUOffloadingSpec")
+        extra_config.setdefault("spec_module_path", "vllm_ascend.kv_offload.npu")
+
+    @classmethod
+    def _prepare_native_kv_offload_config(cls, vllm_config: VllmConfig) -> None:
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if getattr(cache_config, "kv_offloading_size", None) is not None:
+            post_init_kv_transfer_config = getattr(
+                vllm_config, "_post_init_kv_transfer_config", None
+            )
+            if post_init_kv_transfer_config is not None:
+                post_init_kv_transfer_config()
+
+        cls._set_native_kv_offload_spec(vllm_config)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
@@ -286,6 +323,7 @@ class NPUPlatform(Platform):
 
         ascend_config = init_ascend_config(vllm_config)
 
+        cls._prepare_native_kv_offload_config(vllm_config)
         if vllm_config.kv_transfer_config is not None:
             check_kv_extra_config(vllm_config)
             if not getattr(vllm_config.kv_transfer_config, "_engine_id_patched", False):

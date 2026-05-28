@@ -8,7 +8,7 @@ import msgspec.msgpack
 import pytest
 import zmq
 from vllm import LLM, SamplingParams, TokensPrompt
-from vllm.config import KVEventsConfig, KVTransferConfig
+from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
 
 
@@ -108,7 +108,7 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber):
 
 def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
     sampling_params = SamplingParams(max_tokens=1)
-    cpu_block_size = llm.llm_engine.vllm_config.kv_transfer_config.kv_connector_extra_config["block_size"]
+    cpu_block_size = llm.llm_engine.vllm_config.cache_config.block_size
 
     subscriber.get_new_cpu_stored_events()
 
@@ -128,23 +128,11 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
     assert success_count >= 0.5 * test_count
 
 
-@pytest.mark.skip(reason="cpu offload connector is deprecated.")
+@pytest.mark.skip(reason="requires NPU hardware and model download.")
 def test_cpu_offloading() -> None:
     """
-    Tests OffloadingConnector with CPUOffloadingSpec.
+    Tests native KV cache CPU offload on Ascend NPU.
     """
-
-    # configure OffloadingConnector (spec_name=CPUOffloadingSpec by default)
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="OffloadingConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "num_cpu_blocks": 1000,
-            "block_size": 128,
-            "spec_name": "NPUOffloadingSpec",
-            "spec_module_path": "vllm_ascend.kv_offload.npu",
-        },
-    )
 
     port: int
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -162,8 +150,9 @@ def test_cpu_offloading() -> None:
     llm = LLM(
         model="Qwen/Qwen3-0.6B",
         gpu_memory_utilization=0.5,
+        kv_offloading_backend="native",
+        kv_offloading_size=8,
         kv_events_config=kv_events_config,
-        kv_transfer_config=kv_transfer_config,
     )
 
     events_endpoint = events_endpoint.replace("*", "127.0.0.1")

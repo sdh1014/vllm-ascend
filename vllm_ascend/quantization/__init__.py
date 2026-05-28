@@ -25,11 +25,13 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .compressed_tensors_config import AscendCompressedTensorsConfig
+    from .gguf_config import AscendGGUFConfig
     from .modelslim_config import AscendModelSlimConfig
 
 __all__ = [
     "AscendModelSlimConfig",
     "AscendCompressedTensorsConfig",
+    "AscendGGUFConfig",
 ]
 
 
@@ -42,4 +44,8 @@ def __getattr__(name: str) -> Any:
         from .compressed_tensors_config import AscendCompressedTensorsConfig
 
         return AscendCompressedTensorsConfig
+    if name == "AscendGGUFConfig":
+        from .gguf_config import AscendGGUFConfig
+
+        return AscendGGUFConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

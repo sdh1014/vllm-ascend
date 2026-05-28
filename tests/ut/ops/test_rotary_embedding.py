@@ -22,6 +22,7 @@ import torch
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, YaRNScalingRotaryEmbedding
 
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding, AscendYaRNRotaryEmbedding
+from vllm_ascend.ops.triton.rope import _get_block_size_head
 
 HEAD_SIZE = 64
 ROTARY_DIM = 64
@@ -30,6 +31,13 @@ BASE = 10000.0
 DTYPE = torch.bfloat16
 SEQ_LEN = 4
 NUM_HEADS = 2
+
+
+def test_triton_rope_uses_smaller_head_tile_for_large_rope_dim():
+    assert _get_block_size_head(is_neox_style=True, rope_dim=256) == 16
+    assert _get_block_size_head(is_neox_style=False, rope_dim=256) == 16
+    assert _get_block_size_head(is_neox_style=True, rope_dim=128) == 64
+    assert _get_block_size_head(is_neox_style=False, rope_dim=128) == 32
 
 
 def _make_tensors(seq_len=SEQ_LEN, num_heads=NUM_HEADS, head_size=HEAD_SIZE):

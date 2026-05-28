@@ -22,6 +22,7 @@ wheel
 xgrammar>=0.1.30
 pandas-stubs
 compressed_tensors>=0.11.0
+gguf>=0.17.0
 
 # Required for disaggregated prefill
 msgpack
