@@ -292,8 +292,6 @@ def _apply_top_k_top_p_ascendc(
 
     if p is None and k is None:
         return logits
-    if not hasattr(torch.ops._C_ascend, "npu_apply_top_k_top_p"):
-        return _apply_top_k_top_p_pytorch(logits, k, p)
     return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
 
 

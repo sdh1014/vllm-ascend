@@ -52,28 +52,6 @@ EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
 
 
-def _try_mask_topk_weights_by_expert_map(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    expert_map: torch.Tensor,
-) -> torch.Tensor | None:
-    try:
-        from vllm.triton_utils import HAS_TRITON
-
-        if not HAS_TRITON:
-            return None
-        from vllm_ascend.ops.triton.moe_weight_mask import (
-            mask_topk_weights_by_expert_map_triton,
-            should_use_moe_weight_mask_triton,
-        )
-
-        if not should_use_moe_weight_mask_triton(topk_weights, topk_ids, expert_map):
-            return None
-        return mask_topk_weights_by_expert_map_triton(topk_weights, topk_ids, expert_map)
-    except Exception:
-        return None
-
-
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
     # grouped_matmul_swiglu_quant_v2 consumes per-expert counts; existing
     # MC2 grouped-matmul paths consume prefix sums.
@@ -406,12 +384,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            masked_topk_weights = _try_mask_topk_weights_by_expert_map(topk_weights, topk_ids, expert_map)
-            if masked_topk_weights is None:
-                mask = expert_map[topk_ids] != -1
-                topk_weights = topk_weights * mask
-            else:
-                topk_weights = masked_topk_weights
+            mask = expert_map[topk_ids] != -1
+            topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
         else:

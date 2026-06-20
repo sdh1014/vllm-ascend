@@ -15,117 +15,46 @@
 # limitations under the License.
 #
 
-from typing import TYPE_CHECKING, Any
-
 import torch
-from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
-from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS, register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
-from vllm.transformers_utils.config import get_safetensors_params_metadata
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_ascend.utils import AWQ_QUANTIZATION_METHOD
 
-if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-    from vllm.model_executor.models.utils import WeightsMapper
-
-
-def _remove_quantization_method() -> None:
-    if AWQ_QUANTIZATION_METHOD in QUANTIZATION_METHODS:
-        QUANTIZATION_METHODS.remove(AWQ_QUANTIZATION_METHOD)
-
-
-_remove_quantization_method()
+try:
+    from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+except (ImportError, ModuleNotFoundError):
+    from vllm.model_executor.layers.quantization.awq import AWQConfig as AutoAWQConfig
 
 
 @register_quantization_config(AWQ_QUANTIZATION_METHOD)
-class AscendAWQConfig(QuantizationConfig):
-    def __init__(
-        self,
-        weight_bits: int,
-        group_size: int,
-        zero_point: bool,
-        modules_to_not_convert: list[str] | None = None,
-    ) -> None:
-        super().__init__()
-        self.weight_bits = weight_bits
-        self.group_size = group_size
-        self.zero_point = zero_point
-        self.modules_to_not_convert = modules_to_not_convert or []
-
-        if self.weight_bits != 4:
-            raise ValueError(
-                f"Currently, only 4-bit weight quantization is supported for AWQ, but got {self.weight_bits} bits."
-            )
-        self.pack_factor = 32 // self.weight_bits
-
-    def __repr__(self) -> str:
-        return (
-            f"AscendAWQConfig(weight_bits={self.weight_bits}, "
-            f"group_size={self.group_size}, "
-            f"zero_point={self.zero_point}, "
-            f"modules_to_not_convert={self.modules_to_not_convert})"
-        )
-
+class AscendAWQConfig(AutoAWQConfig):
     @classmethod
     def get_name(cls) -> str:
         return AWQ_QUANTIZATION_METHOD
 
     @classmethod
-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.half, torch.bfloat16]
-
-    @classmethod
     def get_min_capability(cls) -> int:
         return 0
 
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return [
-            "quant_config.json",
-            "quantize_config.json",
-        ]
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "AscendAWQConfig":
-        weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
-        group_size = cls.get_from_keys(config, ["q_group_size", "group_size"])
-        zero_point = cls.get_from_keys(config, ["zero_point"])
-        modules_to_not_convert = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
-        return cls(weight_bits, group_size, zero_point, modules_to_not_convert)
-
-    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
-        if self.modules_to_not_convert:
-            self.modules_to_not_convert = hf_to_vllm_mapper.apply_list(self.modules_to_not_convert)
-
-    def maybe_update_config(
-        self,
-        model_name: str,
-        hf_config: "PretrainedConfig | None" = None,
-        revision: str | None = None,
-    ) -> None:
-        if self.modules_to_not_convert:
-            return
-
-        unquant_dtypes = {torch.float16, torch.bfloat16, torch.float32}
-        metadata = get_safetensors_params_metadata(model_name, revision=revision)
-        layers = {param_name.rsplit(".", 1)[0] for param_name in metadata}
-        quant_layers = {
-            param_name.rsplit(".", 1)[0]
-            for param_name, info in metadata.items()
-            if (dtype := info.get("dtype", None)) and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
-        }
-        self.modules_to_not_convert = list(layers - quant_layers)
+    def get_supported_act_dtypes(self) -> list[torch.dtype]:
+        return [torch.half, torch.bfloat16]
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> LinearMethodBase | QuantizeMethodBase | None:
-        if isinstance(layer, LinearBase):
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, LinearBase) or (
+            isinstance(layer, ParallelLMHead) and getattr(self, "lm_head_quantized", False)
+        ):
             if is_layer_skipped(
                 prefix,
                 self.modules_to_not_convert,
@@ -133,21 +62,21 @@ class AscendAWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+
             from vllm_ascend.quantization.methods.awq import AscendAWQLinearMethod
 
             return AscendAWQLinearMethod(self)
 
-        if isinstance(layer, FusedMoE):
-            from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
-            from vllm_ascend.quantization.methods.awq import AscendAWQFusedMoEMethod
-
+        if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                 prefix,
                 self.modules_to_not_convert,
-                self.packed_modules_mapping,
                 skip_with_substr=True,
             ):
-                return AscendUnquantizedFusedMoEMethod(layer.moe_config)
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+
+            from vllm_ascend.quantization.methods.awq import AscendAWQFusedMoEMethod
+
             return AscendAWQFusedMoEMethod(self, layer.moe_config)
 
         return None

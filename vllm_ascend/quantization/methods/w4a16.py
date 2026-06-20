@@ -108,6 +108,103 @@ def pack_to_int32(weight: torch.Tensor) -> torch.Tensor:
     return packed_weight
 
 
+def apply_ascend_w4a16_fused_moe(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    use_grouped_topk: bool = False,
+    num_experts: int = -1,
+    expert_map: torch.Tensor | None = None,
+    topk_group: int | None = None,
+    num_expert_group: int | None = None,
+    custom_routing_function: Callable | None = None,
+    scoring_func: str = "softmax",
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+    is_prefill: bool = True,
+    enable_force_load_balance: bool = True,
+    log2phy: torch.Tensor | None = None,
+    global_redundant_expert_num: int = 0,
+    pertoken_scale: Any | None = None,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    mc2_mask: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+    *,
+    quant_type: QuantType = QuantType.W4A16,
+    dynamic_eplb: bool | None = None,
+    w13_weight: torch.Tensor | None = None,
+    w2_weight: torch.Tensor | None = None,
+    w13_weight_scale: torch.Tensor | None = None,
+    w2_weight_scale: torch.Tensor | None = None,
+    w13_weight_offset: torch.Tensor | None = None,
+    w2_weight_offset: torch.Tensor | None = None,
+) -> torch.Tensor:
+    num_shared_experts = getattr(layer, "n_shared_experts", 0)
+    if num_shared_experts is None:
+        num_shared_experts = 0
+    num_logical_experts = get_moe_num_logical_experts(
+        layer,
+        num_experts,
+        global_redundant_expert_num=global_redundant_expert_num,
+        num_shared_experts=num_shared_experts,
+    )
+    assert router_logits.shape[1] == num_logical_experts, (
+        "Number of global experts mismatch (excluding redundancy): "
+        f"router_logits.shape[1]={router_logits.shape[1]}, num_logical_experts={num_logical_experts}"
+    )
+
+    topk_weights, topk_ids = select_experts(
+        hidden_states=x,
+        router_logits=router_logits,
+        top_k=top_k,
+        use_grouped_topk=use_grouped_topk,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        custom_routing_function=custom_routing_function,
+        scoring_func=scoring_func,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=e_score_correction_bias,
+        num_experts=num_logical_experts,
+        tid2eid=tid2eid,
+        input_ids=input_ids,
+    )
+
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(x.dtype)
+    if dynamic_eplb is None:
+        dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+
+    moe_comm_method = _EXTRA_CTX.moe_comm_method
+    return moe_comm_method.fused_experts(
+        fused_experts_input=build_fused_experts_input(
+            hidden_states=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1=w13_weight if w13_weight is not None else layer.w13_weight_packed,
+            w2=w2_weight if w2_weight is not None else layer.w2_weight_packed,
+            quant_type=quant_type,
+            dynamic_eplb=dynamic_eplb,
+            expert_map=expert_map,
+            global_redundant_expert_num=global_redundant_expert_num,
+            mc2_mask=mc2_mask,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            log2phy=log2phy,
+            pertoken_scale=pertoken_scale,
+            activation=activation,
+            w1_scale=w13_weight_scale if w13_weight_scale is not None else layer.w13_weight_scale,
+            w2_scale=w2_weight_scale if w2_weight_scale is not None else layer.w2_weight_scale,
+            w1_offset=w13_weight_offset if w13_weight_offset is not None else layer.w13_weight_offset,
+            w2_offset=w2_weight_offset if w2_weight_offset is not None else layer.w2_weight_offset,
+            swiglu_limit=layer.swiglu_limit,
+        )
+    )
+
+
 @register_scheme("W4A16", "moe")
 class AscendW4A16FusedMoEMethod(AscendMoEScheme):
     """FusedMoE method for Ascend W4A16.
@@ -271,62 +368,32 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        num_shared_experts = getattr(layer, "n_shared_experts", 0)
-        if num_shared_experts is None:
-            num_shared_experts = 0
-        num_logical_experts = get_moe_num_logical_experts(
+        return apply_ascend_w4a16_fused_moe(
             layer,
-            num_experts,
-            global_redundant_expert_num=global_redundant_expert_num,
-            num_shared_experts=num_shared_experts,
-        )
-        assert router_logits.shape[1] == num_logical_experts, (
-            "Number of global experts mismatch (excluding redundancy): "
-            f"router_logits.shape[1]={router_logits.shape[1]}, num_logical_experts={num_logical_experts}"
-        )
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
+            x,
+            router_logits,
+            top_k,
+            renormalize,
             use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
+            num_experts=num_experts,
+            expert_map=expert_map,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
-            num_experts=num_logical_experts,
+            is_prefill=is_prefill,
+            enable_force_load_balance=enable_force_load_balance,
+            log2phy=log2phy,
+            global_redundant_expert_num=global_redundant_expert_num,
+            pertoken_scale=pertoken_scale,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            mc2_mask=mc2_mask,
             tid2eid=tid2eid,
-        )
-
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        return moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=layer.w13_weight_packed,
-                w2=layer.w2_weight_packed,
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w1_offset=layer.w13_weight_offset,
-                w2_offset=layer.w2_weight_offset,
-                swiglu_limit=layer.swiglu_limit,
-            )
+            quant_type=self.quant_type,
+            dynamic_eplb=self.dynamic_eplb,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

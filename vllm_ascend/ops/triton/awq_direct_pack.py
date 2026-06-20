@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""AWQ direct-pack Triton-Ascend candidate."""
+"""AWQ direct-pack Triton-Ascend helper."""
 
 import torch
 from vllm.triton_utils import tl, triton  # type: ignore[import-not-found]
@@ -72,11 +72,16 @@ def _awq_direct_pack_candidate_kernel(
     tl.store(output + offsets, repacked, mask=mask)
 
 
-def awq_direct_pack_candidate(
+def awq_direct_pack(
     qweight: torch.Tensor,
     block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> torch.Tensor:
-    assert qweight.dtype == torch.int32
+    if qweight.dim() != 2:
+        raise ValueError(f"AWQ direct-pack expects a 2D tensor, but got {tuple(qweight.shape)}.")
+    if qweight.device.type != "npu":
+        raise ValueError("AWQ direct-pack expects an NPU tensor.")
+    if qweight.dtype != torch.int32:
+        raise ValueError(f"AWQ qweight must be int32, but got {qweight.dtype}.")
     if not triton_kernel_launchable():
         raise RuntimeError("Triton-Ascend direct-pack kernel is not launchable.")
     qweight = qweight.contiguous()
@@ -89,3 +94,6 @@ def awq_direct_pack_candidate(
         BLOCK_SIZE=block_size,
     )
     return output
+
+
+awq_direct_pack_candidate = awq_direct_pack

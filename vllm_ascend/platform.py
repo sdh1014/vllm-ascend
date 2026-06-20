@@ -195,15 +195,14 @@ class NPUPlatform(Platform):
 
         adapt_patch(is_global_patch=True)
 
-        # For online serving, Ascend-specific quantization methods are not choices
-        # natively, so add them to the parser for commands such as
-        # "vllm serve --quantization ascend" and "vllm serve --quantization awq".
+        # For online serving, "ascend" quantization method is not a choice natively,
+        # so we need to add "ascend" quantization method to quantization methods list
+        # and the user can enable quantization using "vllm serve --quantization ascend".
         if parser is not None:
             quant_action = parser._option_string_actions.get("--quantization")
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
-                for quantization_method in (ASCEND_QUANTIZATION_METHOD, AWQ_QUANTIZATION_METHOD):
-                    if quantization_method not in quant_action.choices:
-                        quant_action.choices.append(quantization_method)
+                if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
+                    quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
         if not is_310p():
             from vllm_ascend.quantization import (  # noqa: F401

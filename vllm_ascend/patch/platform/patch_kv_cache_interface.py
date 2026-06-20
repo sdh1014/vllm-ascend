@@ -10,16 +10,10 @@ from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
-
-try:
-    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
-except ImportError:
-
-    @dataclass(frozen=True, kw_only=True)
-    class SlidingWindowMLASpec(MLAAttentionSpec):  # type: ignore
-        sliding_window: int = 0
-        page_size_padded: bool = False
+from vllm.v1.kv_cache_interface import (
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 

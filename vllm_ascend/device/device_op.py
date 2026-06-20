@@ -59,81 +59,6 @@ class BaseDeviceAdaptor:
         active_expert_range=None,
         quant_mode: int = -1,
     ):
-        if not hasattr(torch.ops._C_ascend, "npu_moe_init_routing_custom"):
-            if quant_mode != -1:
-                raise RuntimeError("npu_moe_init_routing_custom is required for fused quantized routing.")
-            num_tokens, top_k = topk_ids.shape
-            if (
-                active_expert_range is not None
-                and active_num >= topk_ids.numel()
-                and hidden_states.dim() == 2
-                and hidden_states.device.type == "npu"
-            ):
-                try:
-                    from vllm.triton_utils import HAS_TRITON
-
-                    if HAS_TRITON:
-                        from vllm_ascend.ops.triton.moe_routing import (
-                            npu_moe_init_routing_active_expert_triton,
-                        )
-
-                        first_expert, last_expert = active_expert_range
-                        sorted_hidden_states, expanded_row_idx, expert_tokens = (
-                            npu_moe_init_routing_active_expert_triton(
-                                hidden_states,
-                                topk_ids,
-                                first_expert=first_expert,
-                                last_expert=last_expert,
-                            )
-                        )
-                        return sorted_hidden_states, expanded_row_idx, expert_tokens, scale
-                except Exception:
-                    pass
-
-            flat_expert_idx = topk_ids.reshape(-1).to(torch.int32)
-            flat_row_idx = torch.arange(
-                flat_expert_idx.numel(),
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            if active_expert_range is not None:
-                first_expert, last_expert = active_expert_range
-                active_mask = (flat_expert_idx >= first_expert) & (flat_expert_idx < last_expert)
-                selected_flat_row_idx = flat_row_idx[active_mask]
-                local_expert_idx = flat_expert_idx[active_mask] - first_expert
-                stable_sort_key = local_expert_idx * flat_expert_idx.numel() + selected_flat_row_idx
-                sorted_selected_order = torch.argsort(stable_sort_key).to(torch.int32)
-                if active_num < sorted_selected_order.numel():
-                    sorted_selected_order = sorted_selected_order[:active_num]
-                sorted_order = selected_flat_row_idx[sorted_selected_order.to(torch.int64)]
-                expanded_expert_idx = local_expert_idx[sorted_selected_order.to(torch.int64)]
-                expert_count = last_expert - first_expert
-            else:
-                stable_sort_key = flat_expert_idx * flat_expert_idx.numel() + flat_row_idx
-                sorted_order = torch.argsort(stable_sort_key).to(torch.int32)
-                if active_num < sorted_order.numel():
-                    sorted_order = sorted_order[:active_num]
-                expanded_expert_idx = flat_expert_idx[sorted_order.to(torch.int64)]
-                expert_count = expert_num
-            sorted_hidden_states = hidden_states[sorted_order.to(torch.int64) // top_k]
-            expanded_row_idx = torch.zeros_like(flat_row_idx)
-            expanded_row_idx[sorted_order.to(torch.int64)] = torch.arange(
-                sorted_order.numel(),
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-                expanded_expert_idx.to(torch.int32),
-                expert_count,
-            )
-            expert_tokens = torch.cat(
-                [
-                    expert_tokens[:1],
-                    expert_tokens[1:] - expert_tokens[:-1],
-                ],
-            )
-            return sorted_hidden_states, expanded_row_idx, expert_tokens, scale
-
         return torch.ops._C_ascend.npu_moe_init_routing_custom(
             hidden_states,
             topk_ids,
@@ -145,6 +70,7 @@ class BaseDeviceAdaptor:
             active_expert_range=active_expert_range,
             quant_mode=quant_mode,
         )
+
     @staticmethod
     def maybe_normalize_mxfp_scale_layout(scale: torch.Tensor | None) -> torch.Tensor | None:
         return scale

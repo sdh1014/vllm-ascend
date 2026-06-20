@@ -14,55 +14,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import os
 
 import vllm_ascend.patch.platform.patch_camem_allocator  # noqa
 import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_interface  # noqa
-from vllm_ascend import envs
+import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 from vllm_ascend.utils import is_310p
 
-
-def _try_import_patch(module: str) -> None:
-    try:
-        importlib.import_module(module)
-    except ModuleNotFoundError as exc:
-        if exc.name is not None and exc.name.startswith("vllm."):
-            return
-        raise
-    except ImportError as exc:
-        if "vllm." in str(exc):
-            return
-        raise
-
-
-_try_import_patch("vllm_ascend.patch.platform.patch_kv_cache_utils")
-_try_import_patch("vllm_ascend.patch.platform.patch_mla_prefill_backend")
-
 if not is_310p():
-    _try_import_patch("vllm_ascend.patch.platform.patch_mamba_config")
+    import vllm_ascend.patch.platform.patch_mamba_config  # noqa
 else:
-    _try_import_patch("vllm_ascend.patch.platform.patch_mamba_config_310")
-_try_import_patch("vllm_ascend.patch.platform.patch_minimax_m2_config")
-_try_import_patch("vllm_ascend.patch.platform.patch_minimax_usage_accounting")
-_try_import_patch("vllm_ascend.patch.platform.patch_glm_tool_call_streaming")
-_try_import_patch("vllm_ascend.patch.platform.patch_glm47_tool_call_parser")
-_try_import_patch("vllm_ascend.patch.platform.patch_anthropic_system_message")
-_try_import_patch("vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser")
-_try_import_patch("vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser")
-_try_import_patch("vllm_ascend.patch.platform.patch_deepseek_v4_thinking")
-_try_import_patch("vllm_ascend.patch.platform.patch_torch_accelerator")
-_try_import_patch("vllm_ascend.patch.platform.patch_tool_choice_none_content")
-_try_import_patch("vllm_ascend.patch.platform.patch_mamba_manager")
+    import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
+import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
+import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
+import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
+import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_anthropic_system_message  # noqa
+import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_deepseek_v4_thinking  # noqa
+import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
+import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
+import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
-    _try_import_patch("vllm_ascend.patch.platform.patch_multiproc_executor")
+    import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
-_try_import_patch("vllm_ascend.patch.platform.patch_balance_schedule")
+import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 
-if envs.VLLM_ASCEND_APPLY_DSV4_PATCH:
-    _try_import_patch("vllm_ascend.patch.platform.patch_kv_cache_coordinator")
-    _try_import_patch("vllm_ascend.patch.platform.patch_speculative_config")
+import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
-_try_import_patch("vllm_ascend.patch.platform.patch_scheduler")
+import vllm_ascend.patch.platform.patch_scheduler  # noqa

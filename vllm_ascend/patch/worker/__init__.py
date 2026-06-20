@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-import importlib
-
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.utils import is_310p, vllm_version_is
@@ -29,53 +27,48 @@ from vllm_ascend.utils import is_310p, vllm_version_is
 # imported and the v2 worker stays dormant (the release uses the v1 runner).
 _V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is("0.22.1")
 
-
-def _try_import_patch(module: str) -> None:
-    try:
-        importlib.import_module(module)
-    except ModuleNotFoundError as exc:
-        if exc.name is not None and exc.name.startswith("vllm."):
-            return
-        raise
-    except ImportError as exc:
-        if "vllm." in str(exc):
-            return
-        raise
-
 if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
 
     if _V2_MODEL_RUNNER_SUPPORTED:
-        _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_triton")
+        import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
 
 
 import vllm_ascend.patch.worker.patch_weight_utils  # noqa
 import vllm_ascend.patch.worker.patch_distributed  # noqa
-_try_import_patch("vllm_ascend.patch.worker.patch_minimax_m2")
-_try_import_patch("vllm_ascend.patch.worker.patch_minimax_m2_linear_attn")
-_try_import_patch("vllm_ascend.patch.worker.patch_mamba_utils")
-_try_import_patch("vllm_ascend.patch.worker.patch_qwen3_next_mtp")
-_try_import_patch("vllm_ascend.patch.worker.patch_deepseek_compressor")
+import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
+import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
+import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
+import vllm_ascend.patch.worker.patch_qwen3_next_mtp  # noqa
 
 if not is_310p():
-    _try_import_patch("vllm_ascend.patch.worker.patch_qwen3_5")
-    _try_import_patch("vllm_ascend.patch.worker.patch_gdn_attn")
-    _try_import_patch("vllm_ascend.patch.worker.patch_qwen3_dflash")
-    _try_import_patch("vllm_ascend.patch.worker.patch_qwen3vl")
+    import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
+    import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
+    import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 else:
-    _try_import_patch("vllm_ascend.patch.worker.patch_idex_310")
-_try_import_patch("vllm_ascend.patch.worker.patch_rejection_sampler")
-_try_import_patch("vllm_ascend.patch.worker.patch_npugraph_ex_triton")
-_try_import_patch("vllm_ascend.patch.worker.patch_kimi_k25")
-_try_import_patch("vllm_ascend.patch.worker.patch_draft_quarot")
-_try_import_patch("vllm_ascend.patch.worker.patch_cudagraph")
-_try_import_patch("vllm_ascend.patch.worker.patch_deepseek_mtp")
-_try_import_patch("vllm_ascend.patch.worker.patch_gqa_c8")
+    import vllm_ascend.patch.worker.patch_idex_310  # noqa
+import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
+
+# torchair/npugraph_ex is only available on NPU; silently skip when missing
+# so that CPU-only environments (e.g. UT runners without torch_npu) can still
+# import this module without crashing.
+try:  # noqa: SIM105
+    import vllm_ascend.patch.worker.patch_npugraph_ex_triton  # noqa
+except ImportError:
+    pass
+import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
+import vllm_ascend.patch.worker.patch_draft_quarot  # noqa
+import vllm_ascend.patch.worker.patch_cudagraph  # noqa
+import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
+import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
 
 if _V2_MODEL_RUNNER_SUPPORTED:
-    _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_uva")
-    _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_input_batch")
-    _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_model_state")
-    _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_block_table")
-    _try_import_patch("vllm_ascend.patch.worker.patch_v2.patch_attn_utils")
-    _try_import_patch("vllm_ascend.patch.worker.patch_routed_experts_capture")
+    import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
+    import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+
+# only patch routed experts capture in main2main.
+if _V2_MODEL_RUNNER_SUPPORTED:
+    import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa

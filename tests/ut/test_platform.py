@@ -102,9 +102,8 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(len(mock_action.choices), 3)  # original 2 + ascend
 
     @patch("vllm_ascend.utils.adapt_patch")
-    @patch("vllm_ascend.quantization.awq_config.AscendAWQConfig")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_adds_awq_when_missing(self, mock_quant_config, mock_awq_config, mock_adapt_patch):
+    def test_pre_register_and_update_adds_only_ascend_cli_choice(self, mock_quant_config, mock_adapt_patch):
         mock_parser = MagicMock()
         mock_action = MagicMock()
         mock_action.choices = ["gptq"]
@@ -114,16 +113,16 @@ class TestNPUPlatform(TestBase):
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
         self.assertIn(ASCEND_QUANTIZATION_METHOD, mock_action.choices)
-        self.assertIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
+        self.assertNotIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
 
     @patch("vllm_ascend.platform.is_310p", return_value=True)
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.awq_config.AscendAWQConfig")
     @patch("vllm_ascend._310p.quantization.AscendModelSlimConfig310")
-    def test_pre_register_and_update_imports_awq_on_310p(
+    def test_pre_register_and_update_keeps_awq_out_of_cli_choices_on_310p(
         self,
         mock_quant_config,
-        mock_awq_config,
+        _mock_awq_config,
         mock_adapt_patch,
         mock_is_310p,
     ):
@@ -135,7 +134,7 @@ class TestNPUPlatform(TestBase):
         self.platform.pre_register_and_update(mock_parser)
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
-        self.assertIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
+        self.assertNotIn(AWQ_QUANTIZATION_METHOD, mock_action.choices)
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")

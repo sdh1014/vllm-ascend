@@ -44,7 +44,6 @@ def select_experts(
     num_logical_experts: int = -1,
     num_shared_experts: int = 0,
     num_experts: int = -1,
-    global_num_experts: int | None = None,
     input_ids: torch.Tensor | None = None,
     tid2eid: torch.Tensor | None = None,
 ):
@@ -69,9 +68,6 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
-    if global_num_experts is not None:
-        num_experts = global_num_experts
-
     # prefetch w1_w3_proj.weight preprocess
     weight_prefetch_method = get_weight_prefetch_method()
     if weight_prefetch_method:
@@ -118,6 +114,9 @@ def select_experts(
             tid2eid=None,
             input_ids=None,
         )
+        # Apply routed scaling factor to weights
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
         batch_size = topk_ids.shape[0]
@@ -147,8 +146,6 @@ def check_npu_moe_gating_top_k(
     scoring_func: str = "softmax",
     custom_routing_function: Callable | None = None,
 ):
-    if not _has_npu_moe_gating_top_k_op(scoring_func):
-        return False
     if scoring_func == "sigmoid" and not renormalize:  # sigmoid + renorm=0 is not supported in current branch
         return False
     if custom_routing_function is not None:
@@ -170,11 +167,6 @@ def check_npu_moe_gating_top_k(
     if topk_group * hidden_states.shape[-1] / num_expert_group < top_k:  # noqa: SIM103
         return False
     return True
-
-
-def _has_npu_moe_gating_top_k_op(scoring_func: str) -> bool:
-    op_name = "moe_gating_top_k_hash" if scoring_func == "sqrtsoftplus" else "moe_gating_top_k"
-    return hasattr(torch.ops._C_ascend, op_name)
 
 
 def _native_grouped_topk(
