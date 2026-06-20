@@ -8,6 +8,7 @@ pytest.importorskip("torch_npu")
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_ascend.quantization.awq_config import AscendAWQConfig
 from vllm_ascend.quantization.methods.awq import (
@@ -20,13 +21,15 @@ from vllm_ascend.quantization.methods.awq import (
     pack_awq_weight_to_ascend_reference,
 )
 
+AUTOAWQ_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
 
 def _pack_int4(values: torch.Tensor) -> torch.Tensor:
     assert values.dim() == 2
     assert values.shape[1] % 8 == 0
     packed = torch.zeros(values.shape[0], values.shape[1] // 8, dtype=torch.int32)
-    for index in range(8):
-        packed |= (values[:, index::8].to(torch.int32) & 0xF) << (4 * index)
+    for logical_index, checkpoint_index in enumerate(AUTOAWQ_PACK_ORDER):
+        packed |= (values[:, logical_index::8].to(torch.int32) & 0xF) << (4 * checkpoint_index)
     return packed
 
 
@@ -150,6 +153,89 @@ def test_awq_group_plan(
         torch.testing.assert_close(local_scales, scales[expected_group_ids])
         torch.testing.assert_close(make_awq_zeros(local_qzeros, output_size), qzero_values[expected_group_ids] % 16)
 
+        captured: dict[str, torch.Tensor] = {}
+
+        def capture_loader(
+            _param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            _shard_id: str,
+            _expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            captured[weight_name] = loaded_weight
+            return True if return_success else None
+
+        moe_config = MagicMock()
+        moe_config.tp_size = tp_size
+        moe_config.tp_rank = tp_rank
+        layer = torch.nn.Module()
+        layer.moe_config = moe_config
+        config = AscendAWQConfig.from_config(
+            {"bits": 4, "group_size": checkpoint_group_size, "zero_point": True}
+        )
+        method = AscendAWQFusedMoEMethod(config, moe_config)
+        method.create_weights(
+            layer,
+            num_experts=1,
+            hidden_size=global_k,
+            intermediate_size_per_partition=local_k,
+            params_dtype=torch.float16,
+            intermediate_size_full=global_k,
+            weight_loader=capture_loader,
+        )
+
+        assert layer.awq_runtime_group_size == expected_runtime_group_size
+        assert layer.w13_scales.shape[1] == (
+            1 if expected_runtime_group_size == 0 else global_k // expected_runtime_group_size
+        )
+        assert layer.w2_scales.shape[1] == (
+            1 if expected_runtime_group_size == 0 else local_k // expected_runtime_group_size
+        )
+
+        moe_w13_plan = build_awq_group_plan(
+            checkpoint_group_size,
+            global_k,
+            global_k,
+            0,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            runtime_group_size=expected_runtime_group_size,
+        )
+        moe_w2_plan = build_awq_group_plan(
+            checkpoint_group_size,
+            global_k,
+            local_k,
+            shard_start,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            runtime_group_size=expected_runtime_group_size,
+        )
+        layer.w13_scales.weight_loader(
+            layer.w13_scales,
+            scales,
+            "w13_scales",
+            "w1",
+            0,
+            return_success=True,
+        )
+        layer.w2_scales.weight_loader(
+            layer.w2_scales,
+            scales,
+            "w2_scales",
+            "w2",
+            0,
+            return_success=True,
+        )
+        torch.testing.assert_close(
+            captured["w13_scales"],
+            apply_awq_group_plan(scales, moe_w13_plan, group_dim=0),
+        )
+        torch.testing.assert_close(
+            captured["w2_scales"],
+            apply_awq_group_plan(scales, moe_w2_plan, group_dim=0),
+        )
+
 
 def _new_linear_layer() -> LinearBase:
     layer = LinearBase.__new__(LinearBase)
@@ -161,6 +247,12 @@ def _new_routed_experts_layer() -> RoutedExperts:
     layer = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(layer)
     layer.moe_config = MagicMock()
+    return layer
+
+
+def _new_lm_head_layer() -> ParallelLMHead:
+    layer = ParallelLMHead.__new__(ParallelLMHead)
+    torch.nn.Module.__init__(layer)
     return layer
 
 
@@ -177,12 +269,18 @@ def test_awq_config_dispatch():
     quantized_linear = config.get_quant_method(_new_linear_layer(), "model.layers.0.self_attn.q_proj")
     skipped_linear = config.get_quant_method(_new_linear_layer(), "model.skip_linear")
     quantized_moe = config.get_quant_method(_new_routed_experts_layer(), "model.layers.0.mlp.experts")
+    config.lm_head_quantized = True
+    quantized_lm_head = config.get_quant_method(_new_lm_head_layer(), "lm_head")
+    config.lm_head_quantized = False
+    skipped_lm_head = config.get_quant_method(_new_lm_head_layer(), "lm_head")
     with patch.object(UnquantizedFusedMoEMethod, "__init__", return_value=None):
         skipped_moe = config.get_quant_method(_new_routed_experts_layer(), "model.skip_experts")
 
     assert isinstance(quantized_linear, AscendAWQLinearMethod)
     assert isinstance(quantized_moe, AscendAWQFusedMoEMethod)
+    assert isinstance(quantized_lm_head, AscendAWQLinearMethod)
     assert isinstance(skipped_linear, UnquantizedLinearMethod)
+    assert not isinstance(skipped_lm_head, AscendAWQLinearMethod)
     assert isinstance(skipped_moe, UnquantizedFusedMoEMethod)
 
 

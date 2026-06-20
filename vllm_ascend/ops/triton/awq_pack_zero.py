@@ -4,12 +4,6 @@ from vllm.triton_utils import tl, triton
 DEFAULT_BLOCK_SIZE = 1024
 
 
-def triton_kernel_launchable(kernel: object | None = None) -> bool:
-    if kernel is None:
-        kernel = _awq_pack_zero_kernel
-    return callable(getattr(kernel, "__getitem__", None))
-
-
 @triton.jit
 def _awq_pack_zero_kernel(
     qweight,
@@ -92,8 +86,6 @@ def awq_pack_zero_triton(
             f"(*, {triton.cdiv(output_size, 8)}), but got {tuple(qzeros.shape)}."
         )
 
-    if not triton_kernel_launchable():
-        raise RuntimeError("Triton-Ascend fused pack-zero kernel is not launchable.")
     if not qweight.is_contiguous():
         qweight = qweight.contiguous()
     if not qzeros.is_contiguous():

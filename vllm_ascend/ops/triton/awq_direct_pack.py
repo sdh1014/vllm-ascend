@@ -31,12 +31,6 @@ def _direct_pack_grid(n_elements: int, block_size: int) -> tuple[int]:
     return (_ceil_div(n_elements, block_size),)
 
 
-def triton_kernel_launchable(kernel: object | None = None) -> bool:
-    if kernel is None:
-        kernel = _awq_direct_pack_candidate_kernel
-    return callable(getattr(kernel, "__getitem__", None))
-
-
 @triton.jit
 def _awq_direct_pack_candidate_kernel(
     qweight,
@@ -82,8 +76,6 @@ def awq_direct_pack(
         raise ValueError("AWQ direct-pack expects an NPU tensor.")
     if qweight.dtype != torch.int32:
         raise ValueError(f"AWQ qweight must be int32, but got {qweight.dtype}.")
-    if not triton_kernel_launchable():
-        raise RuntimeError("Triton-Ascend direct-pack kernel is not launchable.")
     qweight = qweight.contiguous()
     output = torch.empty_like(qweight)
     grid = _direct_pack_grid(qweight.numel(), block_size)

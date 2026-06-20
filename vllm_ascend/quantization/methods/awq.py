@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import gcd
@@ -24,6 +23,7 @@ from typing import Any
 import torch
 import torch_npu
 from torch.nn import Parameter
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
@@ -45,7 +45,7 @@ AWQ_INT4PACK_INNER_K_TILES = 0
 AWQ_TRITON_BLOCK_SIZE = 1024
 AWQ_PACK_FACTOR = 8
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,7 @@ def build_awq_group_plan(
     *,
     tp_size: int = 1,
     tp_rank: int = 0,
+    runtime_group_size: int | None = None,
 ) -> AWQGroupPlan:
     if checkpoint_group_size == -1:
         return AWQGroupPlan(
@@ -73,7 +74,8 @@ def build_awq_group_plan(
             local_num_groups=1,
         )
 
-    runtime_group_size = gcd(gcd(checkpoint_group_size, local_k), shard_start)
+    if runtime_group_size is None:
+        runtime_group_size = gcd(gcd(checkpoint_group_size, local_k), shard_start)
     if (
         global_k % checkpoint_group_size != 0
         or runtime_group_size < 32
@@ -133,6 +135,34 @@ def _awq_group_weight_loader(
     return weight_loader
 
 
+def _awq_moe_group_weight_loader(
+    weight_loader: Callable,
+    w13_plan: AWQGroupPlan,
+    w2_plan: AWQGroupPlan,
+) -> Callable:
+    def wrapped_weight_loader(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        if "qzeros" in weight_name or "scales" in weight_name:
+            plan = w13_plan if "w13" in weight_name else w2_plan
+            loaded_weight = apply_awq_group_plan(loaded_weight, plan, group_dim=0)
+        return weight_loader(
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=return_success,
+        )
+
+    return wrapped_weight_loader
+
+
 def _set_awq_moe_weight_attrs(
     param: torch.nn.Parameter,
     extra_weight_attrs: dict[str, Any],
@@ -171,12 +201,13 @@ def _triton_unavailable(exc: BaseException) -> bool:
         return any(
             marker in message
             for marker in (
-                "triton",
-                "backend",
-                "compiler",
-                "device",
-                "driver",
-                "not launchable",
+                "backend is not available",
+                "backend unavailable",
+                "no available backend",
+                "cannot find backend",
+                "compiler is not available",
+                "compiler unavailable",
+                "no available compiler",
             )
         )
     return False
@@ -253,11 +284,11 @@ def pack_awq_weight_to_ascend(
             from vllm_ascend.ops.triton.awq_direct_pack import awq_direct_pack
             return awq_direct_pack(qweight, block_size=AWQ_TRITON_BLOCK_SIZE)
         except (ImportError, ModuleNotFoundError) as exc:
-            logger.warning("AWQ direct Triton pack unavailable: %s", exc)
+            logger.warning_once("AWQ direct Triton pack unavailable: %s", exc)
         except RuntimeError as exc:
             if not _triton_unavailable(exc):
                 raise
-            logger.warning("AWQ direct Triton pack unavailable: %s", exc)
+            logger.warning_once("AWQ direct Triton pack unavailable: %s", exc)
 
     return pack_awq_weight_to_ascend_reference(
         qweight,
@@ -301,11 +332,11 @@ def prepare_awq_zero_offset(
             from vllm_ascend.ops.triton.awq_zero_offset import awq_zero_offset_triton
             return awq_zero_offset_triton(qzeros, scales, output_size)
         except (ImportError, ModuleNotFoundError) as exc:
-            logger.warning("AWQ Triton zero offset unavailable: %s", exc)
+            logger.warning_once("AWQ Triton zero offset unavailable: %s", exc)
         except RuntimeError as exc:
             if not _triton_unavailable(exc):
                 raise
-            logger.warning("AWQ Triton zero offset unavailable: %s", exc)
+            logger.warning_once("AWQ Triton zero offset unavailable: %s", exc)
 
     return prepare_awq_zero_offset_reference(qzeros, scales, output_size, zero_point=True)
 
@@ -364,11 +395,11 @@ def convert_awq_to_ascend(
             )
             return packed_weight, prepare_awq_scale(scales), offset
         except (ImportError, ModuleNotFoundError) as exc:
-            logger.warning("AWQ fused Triton pack-zero unavailable: %s", exc)
+            logger.warning_once("AWQ fused Triton pack-zero unavailable: %s", exc)
         except RuntimeError as exc:
             if not _triton_unavailable(exc):
                 raise
-            logger.warning("AWQ fused Triton pack-zero unavailable: %s", exc)
+            logger.warning_once("AWQ fused Triton pack-zero unavailable: %s", exc)
 
     packed_weight = pack_awq_weight_to_ascend(
         qweight,
@@ -570,17 +601,59 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         super().__init__(moe_config)
         self.quant_config = quant_config
 
-    def _get_moe_group_size(self, input_size: int) -> int:
-        return input_size if self.quant_config.group_size == -1 else self.quant_config.group_size
+    def _get_moe_tp(self, layer: torch.nn.Module) -> tuple[int, int]:
+        moe_config = getattr(layer, "moe_config", None)
+        tp_size = getattr(moe_config, "tp_size", getattr(layer, "tp_size", 1))
+        tp_rank = getattr(moe_config, "tp_rank", getattr(layer, "tp_rank", 0))
+        return int(tp_size), int(tp_rank)
 
-    def _get_num_groups(self, input_size: int, name: str) -> int:
-        group_size = self._get_moe_group_size(input_size)
-        if input_size % group_size != 0:
-            raise ValueError(
-                f"{name} input size is not aligned with AWQ group size. "
-                "This can be caused by too large tensor parallel size."
-            )
-        return input_size // group_size
+    def _get_moe_runtime_group_size(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        w2_shard_start: int,
+    ) -> int:
+        checkpoint_group_size = self.quant_config.group_size
+        if checkpoint_group_size == -1:
+            return 0
+        return gcd(
+            gcd(gcd(checkpoint_group_size, hidden_size), intermediate_size_per_partition),
+            w2_shard_start,
+        )
+
+    def _get_moe_group_plans(
+        self,
+        layer: torch.nn.Module,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        intermediate_size_full: int,
+    ) -> tuple[AWQGroupPlan, AWQGroupPlan]:
+        tp_size, tp_rank = self._get_moe_tp(layer)
+        w2_shard_start = tp_rank * intermediate_size_per_partition
+        runtime_group_size = self._get_moe_runtime_group_size(
+            hidden_size,
+            intermediate_size_per_partition,
+            w2_shard_start,
+        )
+        w13_plan = build_awq_group_plan(
+            self.quant_config.group_size,
+            hidden_size,
+            hidden_size,
+            0,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            runtime_group_size=runtime_group_size,
+        )
+        w2_plan = build_awq_group_plan(
+            self.quant_config.group_size,
+            intermediate_size_full,
+            intermediate_size_per_partition,
+            w2_shard_start,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            runtime_group_size=runtime_group_size,
+        )
+        return w13_plan, w2_plan
 
     def create_weights(
         self,
@@ -591,11 +664,25 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        tp_size, _tp_rank = self._get_moe_tp(layer)
+        intermediate_size_full = extra_weight_attrs.pop(
+            "intermediate_size_full",
+            intermediate_size_per_partition * tp_size,
+        )
+        w13_plan, w2_plan = self._get_moe_group_plans(
+            layer,
+            hidden_size,
+            intermediate_size_per_partition,
+            intermediate_size_full,
+        )
         w13_output_size = 2 * intermediate_size_per_partition
         w2_output_size = hidden_size
-        w13_num_groups = self._get_num_groups(hidden_size, "w13")
-        w2_num_groups = self._get_num_groups(intermediate_size_per_partition, "w2")
         weight_loader = extra_weight_attrs.get("weight_loader")
+        group_weight_loader = (
+            _awq_moe_group_weight_loader(weight_loader, w13_plan, w2_plan)
+            if weight_loader is not None
+            else None
+        )
 
         w13_qweight = PackedvLLMParameter(
             data=torch.empty(
@@ -626,7 +713,7 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         w13_qzeros = PackedvLLMParameter(
             data=torch.empty(
                 num_experts,
-                w13_num_groups,
+                w13_plan.local_num_groups,
                 w13_output_size // self.quant_config.pack_factor,
                 dtype=torch.int32,
             ),
@@ -634,12 +721,12 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
             output_dim=2,
             packed_dim=2,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
+            weight_loader=group_weight_loader,
         )
         w2_qzeros = PackedvLLMParameter(
             data=torch.empty(
                 num_experts,
-                w2_num_groups,
+                w2_plan.local_num_groups,
                 w2_output_size // self.quant_config.pack_factor,
                 dtype=torch.int32,
             ),
@@ -647,19 +734,19 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
             output_dim=2,
             packed_dim=2,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
+            weight_loader=group_weight_loader,
         )
         w13_scales = GroupQuantScaleParameter(
-            data=torch.empty(num_experts, w13_num_groups, w13_output_size, dtype=params_dtype),
+            data=torch.empty(num_experts, w13_plan.local_num_groups, w13_output_size, dtype=params_dtype),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
+            weight_loader=group_weight_loader,
         )
         w2_scales = GroupQuantScaleParameter(
-            data=torch.empty(num_experts, w2_num_groups, w2_output_size, dtype=params_dtype),
+            data=torch.empty(num_experts, w2_plan.local_num_groups, w2_output_size, dtype=params_dtype),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
+            weight_loader=group_weight_loader,
         )
 
         layer.register_parameter("w13_qweight", w13_qweight)
@@ -672,11 +759,11 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         _set_awq_moe_weight_attrs(w2_qweight, extra_weight_attrs)
         layer.register_parameter("w2_qzeros", w2_qzeros)
         _set_awq_moe_group_attrs(w2_qzeros, extra_weight_attrs)
+        set_weight_attrs(w2_qzeros, {"load_full_w2": True})
         layer.register_parameter("w2_scales", w2_scales)
         _set_awq_moe_group_attrs(w2_scales, extra_weight_attrs)
-        layer.awq_runtime_group_size = (
-            0 if self.quant_config.group_size == -1 else self.quant_config.group_size
-        )
+        set_weight_attrs(w2_scales, {"load_full_w2": True})
+        layer.awq_runtime_group_size = w2_plan.runtime_group_size
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_output_size = layer.w13_qweight.shape[2] * self.quant_config.pack_factor

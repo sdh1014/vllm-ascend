@@ -15,15 +15,14 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import os
-
 import pytest
 import torch
 
 from tests.e2e.conftest import VllmRunner
 
 AWQ_ACTIVATION_DTYPE = torch.float16
-AWQ_MOE_MODEL_ENV = "VLLM_ASCEND_AWQ_MOE_MODEL"
+AWQ_MOE_TEST_MODEL = "QuixiAI/Qwen3-30B-A3B-AWQ"
+AUTOAWQ_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 
 
 def _require_npu():
@@ -37,25 +36,20 @@ def _pack_int4(values: torch.Tensor) -> torch.Tensor:
     assert values.dim() == 2
     assert values.shape[1] % 8 == 0
     packed = torch.zeros(values.shape[0], values.shape[1] // 8, dtype=torch.int32)
-    for index in range(8):
-        packed |= (values[:, index::8].to(torch.int32) & 0xF) << (4 * index)
+    for logical_index, checkpoint_index in enumerate(AUTOAWQ_PACK_ORDER):
+        packed |= (values[:, logical_index::8].to(torch.int32) & 0xF) << (4 * checkpoint_index)
     return packed
 
 
 def _dense_awq_reference(
     x: torch.Tensor,
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
+    qweight_values: torch.Tensor,
+    qzero_values: torch.Tensor,
     scales: torch.Tensor,
 ) -> torch.Tensor:
-    from vllm_ascend.quantization.methods.awq import make_awq_zeros, unpack_awq_int32
-
-    output_size = qweight.shape[1] * 8
-    unpacked_weight = unpack_awq_int32(qweight, torch.Size([qweight.shape[0], output_size]))
-    zeros = make_awq_zeros(qzeros, output_size)
-    group_size = qweight.shape[0] // scales.shape[0]
-    group_indices = torch.arange(qweight.shape[0]) // group_size
-    dense_weight = (unpacked_weight.float() - zeros[group_indices].float()) * scales[group_indices].float()
+    group_size = qweight_values.shape[0] // scales.shape[0]
+    group_indices = torch.arange(qweight_values.shape[0]) // group_size
+    dense_weight = (qweight_values.float() - qzero_values[group_indices].float()) * scales[group_indices].float()
     return torch.matmul(x.float(), dense_weight)
 
 
@@ -63,9 +57,9 @@ def test_dense_awq_npu_matmul_matches_reference():
     torch_npu = _require_npu()
     from vllm_ascend.quantization.methods.awq import convert_awq_to_ascend
 
-    input_size = 32
+    input_size = 64
     output_size = 16
-    group_size = 8
+    group_size = 32
     num_groups = input_size // group_size
     qweight_values = torch.arange(input_size * output_size, dtype=torch.int32).view(input_size, output_size) % 16
     qzero_values = (
@@ -77,7 +71,7 @@ def test_dense_awq_npu_matmul_matches_reference():
     scales = (scales / 128).to(AWQ_ACTIVATION_DTYPE)
     x = torch.randn(3, input_size, dtype=AWQ_ACTIVATION_DTYPE) * 0.05
 
-    reference = _dense_awq_reference(x, qweight, qzeros, scales)
+    reference = _dense_awq_reference(x, qweight_values, qzero_values, scales)
     weight, scale, offset = convert_awq_to_ascend(
         qweight.npu(),
         qzeros.npu(),
@@ -98,12 +92,8 @@ def test_dense_awq_npu_matmul_matches_reference():
 
 def test_awq_moe_model_short_generation_smoke():
     _require_npu()
-    model = os.getenv(AWQ_MOE_MODEL_ENV)
-    if not model:
-        pytest.skip(f"Set {AWQ_MOE_MODEL_ENV} to run the AWQ MoE smoke test.")
-
     with VllmRunner(
-        model,
+        AWQ_MOE_TEST_MODEL,
         max_model_len=512,
         gpu_memory_utilization=0.7,
         quantization="awq",

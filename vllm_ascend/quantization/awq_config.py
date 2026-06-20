@@ -22,16 +22,12 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_ascend.utils import AWQ_QUANTIZATION_METHOD
-
-try:
-    from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
-except (ImportError, ModuleNotFoundError):
-    from vllm.model_executor.layers.quantization.awq import AWQConfig as AutoAWQConfig
 
 
 @register_quantization_config(AWQ_QUANTIZATION_METHOD)
@@ -43,9 +39,6 @@ class AscendAWQConfig(AutoAWQConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 0
-
-    def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.half, torch.bfloat16]
 
     def get_quant_method(
         self,
