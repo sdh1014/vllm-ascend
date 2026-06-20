@@ -38,6 +38,7 @@ from vllm_ascend.ascend_config import init_ascend_config
 # isort: off
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
+    AWQ_QUANTIZATION_METHOD,
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
     FP8_METHOD,
@@ -137,6 +138,7 @@ class NPUPlatform(Platform):
 
     supported_quantization: list[str] = [
         ASCEND_QUANTIZATION_METHOD,
+        AWQ_QUANTIZATION_METHOD,
         COMPRESSED_TENSORS_METHOD,
         FP8_METHOD,
         "deepseek_v4_fp8",
@@ -195,7 +197,12 @@ class NPUPlatform(Platform):
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
         if not is_310p():
-            from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization import (  # noqa: F401
+                AscendAWQConfig,
+                AscendCompressedTensorsConfig,
+                AscendFp8Config,
+                AscendModelSlimConfig,
+            )
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 
