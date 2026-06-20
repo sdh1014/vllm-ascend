@@ -171,6 +171,15 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
     detected = detect_quantization_method(model, revision=revision)
 
     if detected is None:
+        if user_quant is not None:
+            logger.info(
+                "No Ascend-specific quantization signature detected from model "
+                "files for '%s'. Using quantization method '%s' from vLLM "
+                "model config.",
+                model,
+                user_quant,
+            )
+            return
         logger.info(
             'No quantization signature detected from model files for "%s". '
             "The model will be loaded as float. "

@@ -491,13 +491,8 @@ else:
             return shared_out
 
         def _get_quant_type(self) -> QuantType:
-            quant_type = QuantType.NONE
-            method = getattr(self._quant_method, "quant_method", None)
-
-            if method is not None:
-                quant_type = getattr(method, "quant_type", QuantType.NONE)
-
-            return quant_type
+            method = getattr(self._quant_method, "quant_method", self._quant_method)
+            return getattr(method, "quant_type", QuantType.NONE)
 
         @property
         def is_internal_router(self) -> bool:

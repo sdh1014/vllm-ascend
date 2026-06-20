@@ -358,13 +358,8 @@ class AscendFusedMoE(FusedMoE):
         return shared_out
 
     def _get_quant_type(self) -> QuantType:
-        quant_type = QuantType.NONE
-        method = getattr(self.quant_method, "quant_method", None)
-
-        if method is not None:
-            quant_type = getattr(method, "quant_type", QuantType.NONE)
-
-        return quant_type
+        method = getattr(self.quant_method, "quant_method", self.quant_method)
+        return getattr(method, "quant_type", QuantType.NONE)
 
     def update_expert_map(self, new_expert_map):
         self._expert_map = new_expert_map

@@ -61,6 +61,32 @@ class TestVllmAdaptor(unittest.TestCase):
 
     @patch("torch.empty_like", return_value=torch.zeros(16, 32))
     @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")
+    def test_init_w4a16(self, mock_get_config, mock_func):
+        mock_config = MagicMock()
+        mock_config.enable_fused_mc2 = 0
+        mock_get_config.return_value = mock_config
+        num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
+        self.model.model.layers[num_dense_layers].mlp.experts.quant_type = QuantType.W4A16
+        self.mock_layer.quant_type = QuantType.W4A16
+
+        adaptor = VllmEplbAdaptor(self.model)
+
+        expert_weight_key = (QuantType.W4A16, False)
+        self.assertEqual(adaptor.expert_weight_key_per_layer[0], expert_weight_key)
+        self.assertEqual(
+            EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key],
+            (
+                "w13_weight_packed",
+                "w2_weight_packed",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_offset",
+                "w2_weight_offset",
+            ),
+        )
+
+    @patch("torch.empty_like", return_value=torch.zeros(16, 32))
+    @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")
     def test_language_model_w8a8(self, mock_get_config, mock_func):
         mock_config = MagicMock()
         mock_config.enable_fused_mc2 = 0

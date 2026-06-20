@@ -102,6 +102,20 @@ class TestMaybeAutoDetectQuantization(TestBase):
         maybe_auto_detect_quantization(vllm_config)
         self.assertIsNone(vllm_config.model_config.quantization)
 
+    @patch("vllm_ascend.quantization.utils.detect_quantization_method", return_value=None)
+    def test_no_detection_respects_existing_quantization(self, mock_detect):
+        vllm_config = self._make_vllm_config(quantization="awq")
+
+        with patch("vllm_ascend.quantization.utils.logger") as mock_logger:
+            maybe_auto_detect_quantization(vllm_config)
+
+        self.assertEqual(vllm_config.model_config.quantization, "awq")
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args[0]
+        self.assertIn("Using quantization method", call_args[0])
+        self.assertIn("awq", call_args)
+        self.assertNotIn("loaded as float", call_args[0])
+
     @patch("vllm_ascend.quantization.utils.detect_quantization_method", return_value=ASCEND_QUANTIZATION_METHOD)
     def test_user_specified_same_method_no_change(self, mock_detect):
         vllm_config = self._make_vllm_config(quantization=ASCEND_QUANTIZATION_METHOD)
