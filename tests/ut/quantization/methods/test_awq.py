@@ -15,10 +15,7 @@ from vllm_ascend.quantization.methods.awq import (
     convert_awq_to_ascend,
     convert_awq_to_ascend_batch,
     convert_awq_moe_param_to_ascend,
-    make_awq_zeros,
     pack_awq_weight_to_ascend,
-    prepare_awq_scale,
-    prepare_awq_zero_offset,
     unpack_awq_int32,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -28,13 +25,6 @@ def pack_int4(values: torch.Tensor) -> torch.Tensor:
     packed = torch.zeros(values.shape[0], values.shape[1] // 8, dtype=torch.int32)
     for i in range(8):
         packed |= values[:, i::8].to(torch.int32) << (4 * i)
-    return packed
-
-
-def pack_int4_dim0(values: torch.Tensor) -> torch.Tensor:
-    packed = torch.zeros(values.shape[0] // 8, values.shape[1], dtype=torch.int32)
-    for i in range(8):
-        packed |= values[i::8, :].to(torch.int32) << (4 * i)
     return packed
 
 
@@ -51,32 +41,6 @@ class TestAWQConversionHelpers(TestBase):
 
         self.assertEqual(unpacked.dtype, torch.int32)
         torch.testing.assert_close(unpacked, values[:, AWQ_REVERSE_ORDER])
-
-    def test_unpack_awq_int32_packed_dim_1_matches_upstream_reverse_order(self):
-        values = torch.arange(32, dtype=torch.int32).view(2, 16) % 16
-        packed = pack_int4(values)
-
-        unpacked = unpack_awq_int32(packed, torch.Size([2, 14]), packed_dim=1)
-
-        expected = values.view(2, 2, 8)[:, :, AWQ_REVERSE_ORDER].reshape(2, 16)[:, :14]
-        torch.testing.assert_close(unpacked, expected)
-
-    def test_unpack_awq_int32_packed_dim_0_matches_upstream_reverse_order(self):
-        values = torch.arange(48, dtype=torch.int32).view(16, 3) % 16
-        packed = pack_int4_dim0(values)
-
-        unpacked = unpack_awq_int32(packed, torch.Size([14, 3]), packed_dim=0)
-
-        expected = values.view(2, 8, 3)[:, AWQ_REVERSE_ORDER, :].reshape(16, 3)[:14, :]
-        torch.testing.assert_close(unpacked, expected)
-
-    def test_make_awq_zeros_uses_unpacked_checkpoint_values(self):
-        zeros = torch.tensor([[0, 7, 14, 1, 2, 3, 4, 5]], dtype=torch.int32)
-        qzeros = pack_int4(zeros)
-
-        unpacked = make_awq_zeros(qzeros, output_size=8)
-
-        torch.testing.assert_close(unpacked, zeros[:, AWQ_REVERSE_ORDER])
 
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
     def test_pack_awq_weight_to_ascend_subtracts_8_and_passes_inner_k_tiles(self, mock_pack):
@@ -100,26 +64,7 @@ class TestAWQConversionHelpers(TestBase):
         self.assertEqual(breakdown[2]["config"], {"inner_k_tiles": 3})
 
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_pack_awq_weight_to_ascend_uses_triton_weight_pack_by_default(self, mock_pack):
-        qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
-        triton_weight = torch.full_like(qweight, 123)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.return_value = triton_weight
-        mock_pack.side_effect = AssertionError("torch_npu int4pack must not be used by default Triton weight pack")
-
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            packed_weight = pack_awq_weight_to_ascend(qweight, output_size=8)
-
-        torch.testing.assert_close(packed_weight, triton_weight)
-        fake_module.awq_direct_pack_candidate.assert_called_once_with(qweight, block_size=1024)
-        mock_pack.assert_not_called()
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_pack_awq_weight_to_ascend_triton_weight_pack_enabled_uses_candidate(self, mock_pack):
+    def test_pack_awq_weight_to_ascend_uses_triton_candidate(self, mock_pack):
         qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
         triton_weight = torch.full_like(qweight, 123)
         breakdown = []
@@ -129,14 +74,7 @@ class TestAWQConversionHelpers(TestBase):
         mock_pack.side_effect = AssertionError("torch_npu int4pack must not be used by Triton weight pack")
         awq_module._AWQ_TRITON_WEIGHT_PACK_WARNINGS.clear()
 
-        with (
-            patch.dict(
-                "os.environ",
-                {"VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto"},
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
+        with patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}):
             packed_weight = pack_awq_weight_to_ascend(qweight, output_size=8, breakdown=breakdown)
 
         torch.testing.assert_close(packed_weight, triton_weight)
@@ -148,121 +86,9 @@ class TestAWQConversionHelpers(TestBase):
             {
                 "source": "triton_direct_pack",
                 "candidate": "awq_direct_pack_candidate",
-                "block_size_source": "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE",
                 "block_size": 1024,
             },
         )
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_pack_awq_weight_to_ascend_triton_weight_pack_uses_explicit_block_size(self, mock_pack):
-        qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
-        triton_weight = torch.full_like(qweight, 123)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.return_value = triton_weight
-        mock_pack.side_effect = AssertionError("torch_npu int4pack must not be used by Triton weight pack")
-        awq_module._AWQ_TRITON_WEIGHT_PACK_WARNINGS.clear()
-
-        with (
-            patch.dict(
-                "os.environ",
-                {"VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "2048"},
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            packed_weight = pack_awq_weight_to_ascend(qweight, output_size=8)
-
-        torch.testing.assert_close(packed_weight, triton_weight)
-        fake_module.awq_direct_pack_candidate.assert_called_once_with(qweight, block_size=2048)
-        mock_pack.assert_not_called()
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_pack_awq_weight_to_ascend_triton_weight_pack_failure_falls_back(self, mock_pack):
-        qweight_values = torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)
-        qweight = pack_int4(qweight_values)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.side_effect = RuntimeError("launch failed")
-        mock_pack.side_effect = mock_int4pack
-        breakdown = []
-        awq_module._AWQ_TRITON_WEIGHT_PACK_WARNINGS.clear()
-
-        with (
-            patch.dict(
-                "os.environ",
-                {"VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto"},
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            packed_weight = pack_awq_weight_to_ascend(qweight, output_size=8, breakdown=breakdown)
-
-        torch.testing.assert_close(packed_weight, qweight_values[:, AWQ_REVERSE_ORDER] - 8)
-        self.assertEqual(mock_pack.call_count, 1)
-        self.assertEqual([stage["name"] for stage in breakdown], ["unpack_weight", "sign_weight", "pack_weight"])
-        self.assertEqual(breakdown[2]["config"], {"inner_k_tiles": 0})
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_pack_awq_weight_to_ascend_triton_weight_pack_bad_block_size_falls_back(self, mock_pack):
-        qweight_values = torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)
-        qweight = pack_int4(qweight_values)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.side_effect = AssertionError(
-            "Triton path must not be used when block-size env parsing fails"
-        )
-        mock_pack.side_effect = mock_int4pack
-        awq_module._AWQ_TRITON_WEIGHT_PACK_WARNINGS.clear()
-
-        with (
-            patch.dict("os.environ", {"VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "not-an-int"}, clear=False),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            packed_weight = pack_awq_weight_to_ascend(qweight, output_size=8)
-
-        torch.testing.assert_close(packed_weight, qweight_values[:, AWQ_REVERSE_ORDER] - 8)
-        self.assertEqual(mock_pack.call_count, 1)
-        fake_module.triton_kernel_launchable.assert_not_called()
-
-    def test_prepare_awq_scale_returns_contiguous_tensor(self):
-        scales = torch.arange(16, dtype=torch.float32).view(2, 8)[:, ::2]
-        self.assertFalse(scales.is_contiguous())
-
-        prepared = prepare_awq_scale(scales)
-
-        torch.testing.assert_close(prepared, scales)
-        self.assertTrue(prepared.is_contiguous())
-
-    def test_prepare_awq_zero_offset_uses_8_minus_unpacked_zeros(self):
-        zero_values = torch.tensor(
-            [
-                [0, 1, 2, 3, 4, 5, 6, 7],
-                [7, 6, 5, 4, 3, 2, 1, 0],
-            ],
-            dtype=torch.int32,
-        )
-        qzeros = pack_int4(zero_values)
-        scales = torch.arange(16, dtype=torch.float32).view(2, 8)[:, ::2]
-
-        offset = prepare_awq_zero_offset(qzeros, scales, output_size=4, zero_point=True)
-
-        expected_zeros = zero_values[:, AWQ_REVERSE_ORDER][:, :4]
-        self.assertEqual(offset.shape, scales.shape)
-        self.assertEqual(offset.dtype, scales.dtype)
-        self.assertEqual(offset.device, scales.device)
-        self.assertTrue(offset.is_contiguous())
-        torch.testing.assert_close(offset, (8 - expected_zeros).to(scales.dtype))
-
-    def test_prepare_awq_zero_offset_without_zero_point_returns_zeros_like_scales(self):
-        qzeros = pack_int4(torch.zeros(1, 8, dtype=torch.int32))
-        scales = torch.arange(8, dtype=torch.float32).view(1, 8)
-
-        offset = prepare_awq_zero_offset(qzeros, scales, output_size=8, zero_point=False)
-
-        self.assertEqual(offset.shape, scales.shape)
-        self.assertEqual(offset.dtype, scales.dtype)
-        self.assertEqual(offset.device, scales.device)
-        torch.testing.assert_close(offset, torch.zeros_like(scales))
 
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
     def test_convert_awq_to_ascend_with_zero_point(self, mock_pack):
@@ -286,145 +112,6 @@ class TestAWQConversionHelpers(TestBase):
         self.assertEqual(offset.shape, scales.shape)
         self.assertEqual(offset.dtype, scales.dtype)
         torch.testing.assert_close(offset, (8 - expected_zeros).to(scales.dtype))
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_preserves_group_major_scale_layout(self, mock_pack):
-        qweight_values = torch.tensor(
-            [
-                [8, 9, 10, 11, 12, 13, 14, 15],
-                [7, 6, 5, 4, 3, 2, 1, 0],
-            ],
-            dtype=torch.int32,
-        )
-        zero_values = torch.tensor(
-            [
-                [0, 1, 2, 3, 4, 5, 6, 7],
-                [7, 6, 5, 4, 3, 2, 1, 0],
-            ],
-            dtype=torch.int32,
-        )
-        scales = torch.arange(1, 17, dtype=torch.float32).view(2, 8)
-        mock_pack.side_effect = mock_int4pack
-
-        packed_weight, scale, offset = convert_awq_to_ascend(
-            pack_int4(qweight_values),
-            pack_int4(zero_values),
-            scales,
-            zero_point=True,
-        )
-
-        expected_weight = qweight_values[:, AWQ_REVERSE_ORDER]
-        expected_zeros = zero_values[:, AWQ_REVERSE_ORDER]
-        torch.testing.assert_close(packed_weight, expected_weight - 8)
-        torch.testing.assert_close(scale, scales)
-        torch.testing.assert_close(offset, (8 - expected_zeros).to(scales.dtype))
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_without_zero_point(self, mock_pack):
-        qweight_values = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)
-        zero_values = torch.zeros(1, 8, dtype=torch.int32)
-        scales = torch.ones(1, 8, dtype=torch.float32)
-        mock_pack.side_effect = mock_int4pack
-
-        packed_weight, scale, offset = convert_awq_to_ascend(
-            pack_int4(qweight_values),
-            pack_int4(zero_values),
-            scales,
-            zero_point=False,
-        )
-
-        torch.testing.assert_close(
-            packed_weight,
-            qweight_values[:, AWQ_REVERSE_ORDER] - 8,
-        )
-        torch.testing.assert_close(scale, scales)
-        torch.testing.assert_close(offset, torch.zeros_like(scales))
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_triton_weight_pack_preserves_scale_and_zero(self, mock_pack):
-        qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
-        zero_values = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)
-        qzeros = pack_int4(zero_values)
-        scales = torch.arange(1, 9, dtype=torch.float32).view(1, 8)
-        triton_weight = torch.full_like(qweight, 123)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.return_value = triton_weight
-        mock_pack.side_effect = AssertionError("torch_npu int4pack must not be used by Triton weight pack")
-        awq_module._AWQ_TRITON_WEIGHT_PACK_WARNINGS.clear()
-
-        with (
-            patch.dict(
-                "os.environ",
-                {"VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto"},
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            packed_weight, scale, offset = convert_awq_to_ascend(qweight, qzeros, scales, zero_point=True)
-
-        torch.testing.assert_close(packed_weight, triton_weight)
-        torch.testing.assert_close(scale, scales)
-        self.assertTrue(scale.is_contiguous())
-        torch.testing.assert_close(offset, (8 - zero_values[:, AWQ_REVERSE_ORDER]).to(scales.dtype))
-        self.assertTrue(offset.is_contiguous())
-        mock_pack.assert_not_called()
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_passes_explicit_inner_k_tiles(self, mock_pack):
-        qweight_values = torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)
-        zero_values = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)
-        scales = torch.arange(1, 9, dtype=torch.float32).view(1, 8)
-        mock_pack.side_effect = mock_int4pack
-
-        convert_awq_to_ascend(
-            pack_int4(qweight_values),
-            pack_int4(zero_values),
-            scales,
-            zero_point=True,
-            inner_k_tiles=1,
-        )
-
-        self.assertEqual(mock_pack.call_args.kwargs["inner_k_tiles"], 1)
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_does_not_mutate_checkpoint_tensors(self, mock_pack):
-        qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
-        qzeros = pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32))
-        scales = torch.arange(1, 9, dtype=torch.float32).view(1, 8)
-        qweight_before = qweight.clone()
-        qzeros_before = qzeros.clone()
-        scales_before = scales.clone()
-        mock_pack.side_effect = mock_int4pack
-
-        convert_awq_to_ascend(qweight, qzeros, scales, zero_point=True)
-
-        torch.testing.assert_close(qweight, qweight_before)
-        torch.testing.assert_close(qzeros, qzeros_before)
-        torch.testing.assert_close(scales, scales_before)
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_breakdown_records_stage_structure(self, mock_pack):
-        qweight = pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32))
-        qzeros = pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32))
-        scales = torch.arange(1, 9, dtype=torch.float32).view(1, 8)
-        breakdown = []
-        mock_pack.side_effect = mock_int4pack
-
-        convert_awq_to_ascend(qweight, qzeros, scales, zero_point=True, breakdown=breakdown)
-
-        self.assertEqual(
-            [stage["name"] for stage in breakdown],
-            ["unpack_weight", "sign_weight", "pack_weight", "prepare_scale", "unpack_zeros", "prepare_offset"],
-        )
-        for stage in breakdown:
-            self.assertIsInstance(stage["wall_ms"], float)
-            self.assertIsNone(stage["npu_event_ms"])
-            self.assertEqual(
-                set(stage["memory"]),
-                {"before", "after", "delta"},
-            )
-        self.assertEqual(breakdown[2]["config"], {"inner_k_tiles": AWQ_INT4PACK_INNER_K_TILES})
 
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
     def test_convert_awq_to_ascend_batch_packs_concatenated_weights_once(self, mock_pack):
@@ -458,48 +145,6 @@ class TestAWQConversionHelpers(TestBase):
             torch.testing.assert_close(packed_weight, qweight[:, AWQ_REVERSE_ORDER] - 8)
             torch.testing.assert_close(packed_scale, scale)
             torch.testing.assert_close(offset, (8 - qzero[:, AWQ_REVERSE_ORDER]).to(scale.dtype))
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_convert_awq_to_ascend_batch_without_zero_point(self, mock_pack):
-        qweight_values = [
-            torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32),
-            torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32),
-        ]
-        scales = [torch.ones(1, 8, dtype=torch.float32), torch.full((1, 8), 2.0)]
-        mock_pack.side_effect = mock_int4pack
-
-        outputs = convert_awq_to_ascend_batch(
-            [pack_int4(values) for values in qweight_values],
-            None,
-            scales,
-            zero_point=False,
-        )
-
-        self.assertEqual(mock_pack.call_count, 1)
-        for output, qweight, scale in zip(outputs, qweight_values, scales, strict=True):
-            packed_weight, packed_scale, offset = output
-            torch.testing.assert_close(packed_weight, qweight[:, AWQ_REVERSE_ORDER] - 8)
-            torch.testing.assert_close(packed_scale, scale)
-            torch.testing.assert_close(offset, torch.zeros_like(scale))
-
-    def test_convert_awq_to_ascend_batch_rejects_mismatched_shapes(self):
-        qweights = [
-            pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)),
-            pack_int4(
-                torch.tensor(
-                    [
-                        [7, 6, 5, 4, 3, 2, 1, 0],
-                        [0, 1, 2, 3, 4, 5, 6, 7],
-                    ],
-                    dtype=torch.int32,
-                )
-            ),
-        ]
-        qzeros = [pack_int4(torch.zeros(1, 8, dtype=torch.int32)) for _ in qweights]
-        scales = [torch.ones(1, 8, dtype=torch.float32), torch.ones(2, 8, dtype=torch.float32)]
-
-        with self.assertRaisesRegex(ValueError, "identical shape and dtype"):
-            convert_awq_to_ascend_batch(qweights, qzeros, scales, zero_point=True)
 
 
 def make_awq_moe_method(group_size=4, zero_point=True):
@@ -609,46 +254,6 @@ class TestAscendAWQFusedMoEMethod(TestBase):
         torch.testing.assert_close(layer.w13_scales[0, :, :8], full_w1_scales[:, 8:16])
         torch.testing.assert_close(layer.w13_scales[0, :, 8:16], full_w3_scales[:, 8:16])
         torch.testing.assert_close(layer.w2_scales[0], full_w2_scales[2:4])
-
-    @patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
-    @patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
-    def test_create_weights_covers_tp_intermediate_partition(self, *_):
-        method = make_awq_moe_method(group_size=4)
-        layer = torch.nn.Module()
-
-        method.create_weights(
-            layer,
-            num_experts=2,
-            hidden_size=16,
-            intermediate_size_per_partition=4,
-            params_dtype=torch.float16,
-        )
-
-        self.assertEqual(layer.w13_qweight.shape, torch.Size([2, 16, 1]))
-        self.assertEqual(layer.w13_qzeros.shape, torch.Size([2, 4, 1]))
-        self.assertEqual(layer.w13_scales.shape, torch.Size([2, 4, 8]))
-        self.assertEqual(layer.w2_qweight.shape, torch.Size([2, 4, 2]))
-        self.assertEqual(layer.w2_qzeros.shape, torch.Size([2, 1, 2]))
-        self.assertEqual(layer.w2_scales.shape, torch.Size([2, 1, 16]))
-
-    @patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
-    @patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
-    def test_create_weights_group_size_minus_one_uses_each_moe_input_size(self, *_):
-        method = make_awq_moe_method(group_size=-1)
-        layer = torch.nn.Module()
-
-        method.create_weights(
-            layer,
-            num_experts=2,
-            hidden_size=16,
-            intermediate_size_per_partition=8,
-            params_dtype=torch.float16,
-        )
-
-        self.assertEqual(layer.w13_qzeros.shape, torch.Size([2, 1, 2]))
-        self.assertEqual(layer.w13_scales.shape, torch.Size([2, 1, 16]))
-        self.assertEqual(layer.w2_qzeros.shape, torch.Size([2, 1, 2]))
-        self.assertEqual(layer.w2_scales.shape, torch.Size([2, 1, 16]))
 
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
     def test_convert_awq_moe_param_to_ascend_converts_each_expert_partition(self, mock_pack):
@@ -919,240 +524,6 @@ class TestAscendAWQLinearMethod(TestBase):
             8 - zero_values[:, AWQ_REVERSE_ORDER].to(torch.float32),
         )
 
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_process_weights_after_loading_triton_prewarm_is_disabled_by_default(self, mock_pack):
-        config = AscendAWQConfig.from_config({"bits": 4, "group_size": 4, "zero_point": True})
-        method = AscendAWQLinearMethod(config)
-        layer = torch.nn.Module()
-        layer.qweight = torch.nn.Parameter(
-            pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)),
-            requires_grad=False,
-        )
-        layer.qzeros = torch.nn.Parameter(
-            pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)),
-            requires_grad=False,
-        )
-        layer.scales = torch.nn.Parameter(torch.ones(1, 8, dtype=torch.float32), requires_grad=False)
-        mock_pack.side_effect = mock_int4pack
-
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.side_effect = AssertionError(
-            "Triton path must not be used when prewarm is disabled"
-        )
-        with (
-            patch.dict("os.environ", {"VLLM_ASCEND_AWQ_TRITON_PREWARM": "0"}, clear=False),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            method.process_weights_after_loading(layer)
-
-        self.assertEqual(mock_pack.call_count, 1)
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_process_weights_after_loading_triton_prewarm_deduplicates_specialization(self, mock_pack):
-        config = AscendAWQConfig.from_config({"bits": 4, "group_size": 4, "zero_point": True})
-        method = AscendAWQLinearMethod(config)
-        calls = []
-
-        def candidate(qweight, block_size=None):
-            calls.append((tuple(qweight.shape), block_size))
-            return qweight.clone()
-
-        def make_layer():
-            layer = torch.nn.Module()
-            layer.qweight = torch.nn.Parameter(
-                pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)),
-                requires_grad=False,
-            )
-            layer.qzeros = torch.nn.Parameter(
-                pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)),
-                requires_grad=False,
-            )
-            layer.scales = torch.nn.Parameter(torch.ones(1, 8, dtype=torch.float32), requires_grad=False)
-            return layer
-
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.side_effect = candidate
-        mock_pack.side_effect = mock_int4pack
-        awq_module._AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.clear()
-        awq_module._AWQ_TRITON_PREWARM_WARNINGS.clear()
-        awq_module._AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = None
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "512",
-                },
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            method.process_weights_after_loading(make_layer())
-            method.process_weights_after_loading(make_layer())
-
-        self.assertEqual(calls, [((1, 1), 512), ((1, 1), 512), ((1, 1), 512)])
-        mock_pack.assert_not_called()
-
-    def test_triton_prewarm_auto_block_size_uses_stable_default_for_all_shapes(self):
-        calls = []
-
-        def candidate(qweight, block_size=None):
-            calls.append((tuple(qweight.shape), block_size))
-            return qweight.clone()
-
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.side_effect = candidate
-        awq_module._AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.clear()
-        awq_module._AWQ_TRITON_PREWARM_WARNINGS.clear()
-        awq_module._AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = None
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto",
-                },
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            awq_module._awq_triton_direct_pack_prewarm(torch.empty(3584, 448, dtype=torch.int32))
-            awq_module._awq_triton_direct_pack_prewarm(torch.empty(3584, 64, dtype=torch.int32))
-            awq_module._awq_triton_direct_pack_prewarm(torch.empty(3584, 2368, dtype=torch.int32))
-            awq_module._awq_triton_direct_pack_prewarm(torch.empty(18944, 448, dtype=torch.int32))
-
-        self.assertEqual(
-            calls,
-            [
-                ((3584, 448), 1024),
-                ((3584, 64), 1024),
-                ((3584, 2368), 1024),
-                ((18944, 448), 1024),
-            ],
-        )
-
-    def test_triton_prewarm_auto_block_size_uses_1024_for_arbitrary_shape(self):
-        calls = []
-
-        def candidate(qweight, block_size=None):
-            calls.append((tuple(qweight.shape), block_size))
-            return qweight.clone()
-
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.side_effect = candidate
-        awq_module._AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.clear()
-        awq_module._AWQ_TRITON_PREWARM_WARNINGS.clear()
-        awq_module._AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = None
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto",
-                },
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            awq_module._awq_triton_direct_pack_prewarm(torch.empty(1, 1, dtype=torch.int32))
-
-        self.assertEqual(calls, [((1, 1), 1024)])
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_process_weights_after_loading_triton_prewarm_failure_does_not_break_loading(self, mock_pack):
-        config = AscendAWQConfig.from_config({"bits": 4, "group_size": 4, "zero_point": True})
-        method = AscendAWQLinearMethod(config)
-        layer = torch.nn.Module()
-        layer.qweight = torch.nn.Parameter(
-            pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)),
-            requires_grad=False,
-        )
-        layer.qzeros = torch.nn.Parameter(
-            pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)),
-            requires_grad=False,
-        )
-        layer.scales = torch.nn.Parameter(torch.ones(1, 8, dtype=torch.float32), requires_grad=False)
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.return_value = True
-        fake_module.awq_direct_pack_candidate.side_effect = RuntimeError("compile failed")
-        mock_pack.side_effect = mock_int4pack
-        awq_module._AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.clear()
-        awq_module._AWQ_TRITON_PREWARM_WARNINGS.clear()
-        awq_module._AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = None
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                    "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "auto",
-                },
-                clear=False,
-            ),
-            patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-        ):
-            method.process_weights_after_loading(layer)
-
-        self.assertEqual(mock_pack.call_count, 1)
-        self.assertEqual(layer.weight.shape, torch.Size([1, 8]))
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_convert_weight_to_int4pack")
-    def test_process_weights_after_loading_triton_prewarm_bad_env_does_not_break_loading(self, mock_pack):
-        config = AscendAWQConfig.from_config({"bits": 4, "group_size": 4, "zero_point": True})
-        method = AscendAWQLinearMethod(config)
-        mock_pack.side_effect = mock_int4pack
-        awq_module._AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.clear()
-        awq_module._AWQ_TRITON_PREWARM_WARNINGS.clear()
-        awq_module._AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = None
-
-        def make_layer():
-            layer = torch.nn.Module()
-            layer.qweight = torch.nn.Parameter(
-                pack_int4(torch.tensor([[8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int32)),
-                requires_grad=False,
-            )
-            layer.qzeros = torch.nn.Parameter(
-                pack_int4(torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.int32)),
-                requires_grad=False,
-            )
-            layer.scales = torch.nn.Parameter(torch.ones(1, 8, dtype=torch.float32), requires_grad=False)
-            return layer
-
-        fake_module = MagicMock()
-        fake_module.triton_kernel_launchable.side_effect = AssertionError(
-            "Triton path must not be used when prewarm env parsing fails"
-        )
-        env_cases = [
-            {"VLLM_ASCEND_AWQ_TRITON_PREWARM": "2"},
-            {
-                "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "0",
-            },
-            {
-                "VLLM_ASCEND_AWQ_TRITON_PREWARM": "1",
-                "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": "not-an-int",
-            },
-        ]
-
-        for env_overrides in env_cases:
-            with (
-                self.subTest(env_overrides=env_overrides),
-                patch.dict("os.environ", env_overrides, clear=False),
-                patch.dict("sys.modules", {"vllm_ascend.ops.triton.awq_direct_pack": fake_module}),
-            ):
-                layer = make_layer()
-                method.process_weights_after_loading(layer)
-                self.assertEqual(layer.weight.shape, torch.Size([1, 8]))
-
-        self.assertEqual(mock_pack.call_count, len(env_cases))
-        self.assertEqual(fake_module.triton_kernel_launchable.call_count, 1)
-
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_weight_quant_batchmatmul")
     def test_apply_uses_npu_weight_quant_matmul(self, mock_matmul):
         config = AscendAWQConfig.from_config({"bits": 4, "group_size": 4, "zero_point": True})
@@ -1179,21 +550,6 @@ class TestAscendAWQLinearMethod(TestBase):
     @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_weight_quant_batchmatmul")
     def test_apply_group_size_minus_one_uses_per_tensor_group_size(self, mock_matmul):
         config = AscendAWQConfig.from_config({"bits": 4, "group_size": -1, "zero_point": True})
-        method = AscendAWQLinearMethod(config)
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(torch.zeros(8, 1, dtype=torch.int32), requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.ones(1, 8, dtype=torch.float32), requires_grad=False)
-        layer.weight_offset = torch.nn.Parameter(torch.zeros(1, 8, dtype=torch.float32), requires_grad=False)
-        x = torch.ones(2, 8, dtype=torch.float16)
-        mock_matmul.return_value = torch.zeros(2, 8, dtype=torch.float16)
-
-        method.apply(layer, x)
-
-        self.assertEqual(mock_matmul.call_args.kwargs["antiquant_group_size"], 0)
-
-    @patch("vllm_ascend.quantization.methods.awq.torch_npu.npu_weight_quant_batchmatmul")
-    def test_apply_group_size_equal_input_uses_per_tensor_group_size(self, mock_matmul):
-        config = AscendAWQConfig.from_config({"bits": 4, "group_size": 8, "zero_point": True})
         method = AscendAWQLinearMethod(config)
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(torch.zeros(8, 1, dtype=torch.int32), requires_grad=False)

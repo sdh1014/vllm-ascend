@@ -23,23 +23,6 @@ from collections.abc import Callable
 from typing import Any
 
 
-def _get_bool_env(name: str, default: str) -> bool:
-    value = os.getenv(name, default)
-    if value not in ("0", "1"):
-        raise ValueError(f"{name} must be 0 or 1, but got {value!r}.")
-    return value == "1"
-
-
-def _get_awq_triton_block_size() -> int | str:
-    value = os.getenv("VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE", "auto")
-    if value == "auto":
-        return value
-    block_size = int(value)
-    if block_size <= 0:
-        raise ValueError("VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE must be positive or 'auto'.")
-    return block_size
-
-
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -130,12 +113,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
-    # Whether to prewarm the optional AWQ Triton direct-pack candidate.
-    # 0: disabled (default), 1: enabled. Not sensitive.
-    "VLLM_ASCEND_AWQ_TRITON_PREWARM": lambda: _get_bool_env("VLLM_ASCEND_AWQ_TRITON_PREWARM", "0"),
-    # Block size for optional AWQ Triton direct-pack prewarm/packing.
-    # Default is "auto"; otherwise use a positive integer. Not sensitive.
-    "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE": _get_awq_triton_block_size,
 }
 
 # end-env-vars-definition

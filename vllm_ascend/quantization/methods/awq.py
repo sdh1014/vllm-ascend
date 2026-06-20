@@ -28,7 +28,6 @@ from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinea
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
@@ -37,12 +36,9 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 AWQ_INT4PACK_INNER_K_TILES = 0
-AWQ_TRITON_PREWARM_DEFAULT_BLOCK_SIZE = 1024
+AWQ_TRITON_BLOCK_SIZE = 1024
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
-_AWQ_TRITON_PREWARM_ATTEMPTED_KEYS: set[tuple[tuple[int, ...], int]] = set()
-_AWQ_TRITON_PREWARM_WARNINGS: set[str] = set()
-_AWQ_TRITON_PREWARM_UNAVAILABLE_REASON: str | None = None
 _AWQ_TRITON_WEIGHT_PACK_WARNINGS: set[str] = set()
 _AWQ_TRITON_ZERO_OFFSET_WARNINGS: set[str] = set()
 _AWQ_TRITON_PACK_ZERO_WARNINGS: set[str] = set()
@@ -79,14 +75,6 @@ def _set_awq_moe_group_attrs(param: torch.nn.Parameter, extra_weight_attrs: dict
     set_weight_attrs(param, attrs)
 
 
-def _log_awq_triton_prewarm_warning_once(message: str) -> None:
-    if message in _AWQ_TRITON_PREWARM_WARNINGS:
-        logger.debug(message)
-        return
-    _AWQ_TRITON_PREWARM_WARNINGS.add(message)
-    logger.warning(message)
-
-
 def _log_awq_triton_weight_pack_warning_once(message: str) -> None:
     if message in _AWQ_TRITON_WEIGHT_PACK_WARNINGS:
         logger.debug(message)
@@ -109,75 +97,6 @@ def _log_awq_triton_pack_zero_warning_once(message: str) -> None:
         return
     _AWQ_TRITON_PACK_ZERO_WARNINGS.add(message)
     logger.warning(message)
-
-
-def _awq_triton_prewarm_block_size() -> int:
-    block_size = envs.VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE
-    if block_size == "auto":
-        return AWQ_TRITON_PREWARM_DEFAULT_BLOCK_SIZE
-    return block_size
-
-
-def _awq_triton_direct_pack_prewarm(qweight: torch.Tensor) -> None:
-    global _AWQ_TRITON_PREWARM_UNAVAILABLE_REASON
-
-    try:
-        prewarm_enabled = envs.VLLM_ASCEND_AWQ_TRITON_PREWARM
-    except Exception as exc:
-        _log_awq_triton_prewarm_warning_once(
-            f"AWQ Triton-Ascend direct-pack prewarm skipped because env parsing failed: {exc}"
-        )
-        return
-
-    if not prewarm_enabled:
-        return
-
-    qweight_shape = tuple(qweight.shape)
-    try:
-        block_size = _awq_triton_prewarm_block_size()
-    except Exception as exc:
-        _log_awq_triton_prewarm_warning_once(
-            f"AWQ Triton-Ascend direct-pack prewarm skipped because block-size env parsing failed: {exc}"
-        )
-        return
-
-    key = (qweight_shape, block_size)
-    if key in _AWQ_TRITON_PREWARM_ATTEMPTED_KEYS:
-        return
-    if _AWQ_TRITON_PREWARM_UNAVAILABLE_REASON is not None:
-        logger.debug(_AWQ_TRITON_PREWARM_UNAVAILABLE_REASON)
-        return
-
-    try:
-        from vllm_ascend.ops.triton.awq_direct_pack import awq_direct_pack_candidate, triton_kernel_launchable
-    except Exception as exc:
-        _AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = f"AWQ Triton-Ascend direct-pack prewarm import failed: {exc}"
-        _log_awq_triton_prewarm_warning_once(_AWQ_TRITON_PREWARM_UNAVAILABLE_REASON)
-        return
-
-    try:
-        if not triton_kernel_launchable():
-            _AWQ_TRITON_PREWARM_UNAVAILABLE_REASON = (
-                "AWQ Triton-Ascend direct-pack prewarm skipped because the kernel is not launchable."
-            )
-            _log_awq_triton_prewarm_warning_once(_AWQ_TRITON_PREWARM_UNAVAILABLE_REASON)
-            return
-
-        _AWQ_TRITON_PREWARM_ATTEMPTED_KEYS.add(key)
-        prewarm_output = awq_direct_pack_candidate(qweight, block_size=block_size)
-        if qweight.device.type == "npu":
-            torch.npu.synchronize()
-        del prewarm_output
-        logger.debug(
-            "AWQ Triton-Ascend direct-pack prewarmed specialization qweight_shape=%s block_size=%s.",
-            list(qweight.shape),
-            block_size,
-        )
-    except Exception as exc:
-        _log_awq_triton_prewarm_warning_once(
-            "AWQ Triton-Ascend direct-pack prewarm failed for "
-            f"qweight_shape={list(qweight.shape)} block_size={block_size}: {exc}"
-        )
 
 
 def _try_awq_triton_weight_pack(qweight: torch.Tensor, block_size: int) -> torch.Tensor | None:
@@ -249,45 +168,6 @@ def _try_awq_triton_pack_zero(
             f"scales_shape={list(scales.shape)} output_size={output_size}: {exc}"
         )
         return None
-
-
-def _awq_triton_pack_zero_prewarm(
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    output_size: int,
-    *,
-    zero_point: bool,
-    num_bits: int,
-    inner_k_tiles: int,
-) -> None:
-    try:
-        prewarm_enabled = envs.VLLM_ASCEND_AWQ_TRITON_PREWARM
-    except Exception as exc:
-        _log_awq_triton_prewarm_warning_once(
-            f"AWQ Triton-Ascend pack-zero prewarm skipped because env parsing failed: {exc}"
-        )
-        return
-
-    if not prewarm_enabled:
-        return
-    if not zero_point or num_bits != 4 or inner_k_tiles != AWQ_INT4PACK_INNER_K_TILES:
-        return
-    if qweight.device.type != "npu" or qzeros.device.type != "npu" or scales.device.type != "npu":
-        return
-
-    try:
-        block_size = _awq_triton_prewarm_block_size()
-    except Exception as exc:
-        _log_awq_triton_prewarm_warning_once(
-            f"AWQ Triton-Ascend pack-zero prewarm skipped because block-size env parsing failed: {exc}"
-        )
-        return
-
-    result = _try_awq_triton_pack_zero(qweight, qzeros, scales, output_size, block_size)
-    if result is not None and qweight.device.type == "npu":
-        torch.npu.synchronize()
-    del result
 
 
 def _conversion_memory_stats(device: torch.device) -> dict[str, int | None]:
@@ -427,30 +307,22 @@ def pack_awq_weight_to_ascend(
     breakdown: list[dict[str, Any]] | None = None,
     inner_k_tiles: int = AWQ_INT4PACK_INNER_K_TILES,
 ) -> torch.Tensor:
-    try:
-        block_size = _awq_triton_prewarm_block_size()
-    except Exception as exc:
-        _log_awq_triton_weight_pack_warning_once(
-            f"AWQ Triton-Ascend weight pack skipped because block-size env parsing failed: {exc}"
-        )
-    else:
-        triton_breakdown = [] if breakdown is not None else None
-        triton_weight = _run_conversion_stage(
-            "pack_weight",
-            qweight,
-            triton_breakdown,
-            lambda: _try_awq_triton_weight_pack(qweight, block_size),
-            config={
-                "source": "triton_direct_pack",
-                "candidate": "awq_direct_pack_candidate",
-                "block_size_source": "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE",
-                "block_size": block_size,
-            },
-        )
-        if triton_weight is not None:
-            if breakdown is not None and triton_breakdown is not None:
-                breakdown.extend(triton_breakdown)
-            return triton_weight
+    triton_breakdown = [] if breakdown is not None else None
+    triton_weight = _run_conversion_stage(
+        "pack_weight",
+        qweight,
+        triton_breakdown,
+        lambda: _try_awq_triton_weight_pack(qweight, AWQ_TRITON_BLOCK_SIZE),
+        config={
+            "source": "triton_direct_pack",
+            "candidate": "awq_direct_pack_candidate",
+            "block_size": AWQ_TRITON_BLOCK_SIZE,
+        },
+    )
+    if triton_weight is not None:
+        if breakdown is not None and triton_breakdown is not None:
+            breakdown.extend(triton_breakdown)
+        return triton_weight
 
     unpacked_weight = _run_conversion_stage(
         "unpack_weight",
@@ -546,31 +418,23 @@ def convert_awq_to_ascend(
         and qzeros.device.type == "npu"
         and scales.device.type == "npu"
     ):
-        try:
-            block_size = _awq_triton_prewarm_block_size()
-        except Exception as exc:
-            _log_awq_triton_pack_zero_warning_once(
-                f"AWQ Triton-Ascend fused pack-zero skipped because block-size env parsing failed: {exc}"
-            )
-        else:
-            triton_breakdown = [] if breakdown is not None else None
-            fused_output = _run_conversion_stage(
-                "pack_weight_zero_offset",
-                qweight,
-                triton_breakdown,
-                lambda: _try_awq_triton_pack_zero(qweight, qzeros, scales, output_size, block_size),
-                config={
-                    "source": "triton_awq_pack_zero",
-                    "block_size_source": "VLLM_ASCEND_AWQ_TRITON_PREWARM_BLOCK_SIZE",
-                    "block_size": block_size,
-                },
-            )
-            if fused_output is not None:
-                if breakdown is not None and triton_breakdown is not None:
-                    breakdown.extend(triton_breakdown)
-                packed_weight, offset = fused_output
-                scale = prepare_awq_scale(scales, breakdown=breakdown)
-                return packed_weight, scale, offset
+        triton_breakdown = [] if breakdown is not None else None
+        fused_output = _run_conversion_stage(
+            "pack_weight_zero_offset",
+            qweight,
+            triton_breakdown,
+            lambda: _try_awq_triton_pack_zero(qweight, qzeros, scales, output_size, AWQ_TRITON_BLOCK_SIZE),
+            config={
+                "source": "triton_awq_pack_zero",
+                "block_size": AWQ_TRITON_BLOCK_SIZE,
+            },
+        )
+        if fused_output is not None:
+            if breakdown is not None and triton_breakdown is not None:
+                breakdown.extend(triton_breakdown)
+            packed_weight, offset = fused_output
+            scale = prepare_awq_scale(scales, breakdown=breakdown)
+            return packed_weight, scale, offset
 
     packed_weight = pack_awq_weight_to_ascend(
         qweight,
@@ -787,17 +651,6 @@ class AscendAWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        _awq_triton_direct_pack_prewarm(layer.qweight.data)
-        _awq_triton_pack_zero_prewarm(
-            layer.qweight.data,
-            layer.qzeros.data,
-            layer.scales.data,
-            layer.qweight.shape[1] * self.quant_config.pack_factor,
-            zero_point=self.quant_config.zero_point,
-            num_bits=self.quant_config.weight_bits,
-            inner_k_tiles=AWQ_INT4PACK_INNER_K_TILES,
-        )
-
         weight, scale, offset = convert_awq_to_ascend(
             layer.qweight.data,
             layer.qzeros.data,
@@ -961,24 +814,6 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
 
         w13_output_size = layer.w13_qweight.shape[2] * self.quant_config.pack_factor
         w2_output_size = layer.w2_qweight.shape[2] * self.quant_config.pack_factor
-        _awq_triton_pack_zero_prewarm(
-            layer.w13_qweight.data.flatten(0, 1),
-            layer.w13_qzeros.data.flatten(0, 1),
-            layer.w13_scales.data.flatten(0, 1),
-            w13_output_size,
-            zero_point=self.quant_config.zero_point,
-            num_bits=self.quant_config.weight_bits,
-            inner_k_tiles=AWQ_INT4PACK_INNER_K_TILES,
-        )
-        _awq_triton_pack_zero_prewarm(
-            layer.w2_qweight.data.flatten(0, 1),
-            layer.w2_qzeros.data.flatten(0, 1),
-            layer.w2_scales.data.flatten(0, 1),
-            w2_output_size,
-            zero_point=self.quant_config.zero_point,
-            num_bits=self.quant_config.weight_bits,
-            inner_k_tiles=AWQ_INT4PACK_INNER_K_TILES,
-        )
         w13_weight, w13_scale, w13_offset = convert_awq_moe_param_to_ascend(
             layer.w13_qweight.data,
             layer.w13_qzeros.data,
