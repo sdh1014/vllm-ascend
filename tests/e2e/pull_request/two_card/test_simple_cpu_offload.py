@@ -8,7 +8,7 @@ import os
 import time
 
 import pytest
-from vllm import SamplingParams, TokensPrompt
+from vllm import SamplingParams
 from vllm.config import KVTransferConfig
 
 from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
@@ -25,30 +25,31 @@ if MODEL is None:
 
 
 def _build_kv_transfer_config(
-    cpu_bytes_to_use: int,
-    lazy_offload: bool = False,
+    cpu_bytes_to_use_per_rank: int,
 ) -> KVTransferConfig:
     return KVTransferConfig(
         kv_connector="SimpleCPUOffloadConnector",
         kv_role="kv_both",
         kv_connector_extra_config={
-            "cpu_bytes_to_use": cpu_bytes_to_use,
-            "lazy_offload": lazy_offload,
+            "cpu_bytes_to_use": 4 << 30,
+            "cpu_bytes_to_use_per_rank": cpu_bytes_to_use_per_rank,
         },
     )
 
 
 @wait_until_npu_memory_free()
-def test_simple_cpu_offload_accuracy() -> None:
+def test_simple_cpu_offload_tp2_per_rank_capacity() -> None:
     sampling_params = SamplingParams(max_tokens=1, temperature=0)
     prompt = "hi " * 500 + "Let's count to ten. One, two, three, "
 
     with VllmRunner(
         MODEL,
         max_model_len=4096,
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
         gpu_memory_utilization=0.5,
         enable_prefix_caching=True,
-        kv_transfer_config=_build_kv_transfer_config(1 << 30),
+        kv_transfer_config=_build_kv_transfer_config(512 * (1 << 20)),
         enforce_eager=True,
     ) as runner:
         llm = runner.model
@@ -66,30 +67,5 @@ def test_simple_cpu_offload_accuracy() -> None:
                 success += 1
 
         assert success >= int(0.5 * attempts), (
-            f"CPU-load accuracy too low: {success}/{attempts} matched baseline output {expected!r}"
+            f"TP2 CPU-load accuracy too low: {success}/{attempts} matched baseline output {expected!r}"
         )
-
-
-@pytest.mark.parametrize("lazy_offload", [False, True])
-@wait_until_npu_memory_free()
-def test_simple_cpu_offload_no_crash_on_repeat(lazy_offload: bool) -> None:
-    sampling_params = SamplingParams(max_tokens=4, temperature=0)
-    prompt_token_ids = [0] * 257
-
-    with VllmRunner(
-        MODEL,
-        max_model_len=2048,
-        gpu_memory_utilization=0.5,
-        enable_prefix_caching=True,
-        kv_transfer_config=_build_kv_transfer_config(
-            cpu_bytes_to_use=512 * (1 << 20),
-            lazy_offload=lazy_offload,
-        ),
-        enforce_eager=True,
-    ) as runner:
-        llm = runner.model
-        for i in range(8):
-            prompt_token_ids[0] = i
-            prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
-            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-            assert outputs and len(outputs[0].outputs[0].token_ids) > 0
