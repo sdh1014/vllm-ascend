@@ -6,6 +6,10 @@ and only overrides what differs on NPU:
 * ``__init__`` swaps the CUDA copy backend for the NPU one. Step-time
   state (event lists, hwm cursors, pending sets, completed-store map)
   is fully inherited.
+* ``get_finished`` keeps upstream's async scheduling semantics but
+  records NPU events on ``torch.npu.current_stream()`` before
+  NPU->CPU stores, so store DMA waits for KV writes on the compute
+  stream.
 * ``register_kv_caches`` rebuilds block views around two NPU-specific
   realities: K/V live in *separate* allocations (not stacked under one
   outer dim) and the runner over-allocates each tensor for 2 MiB
@@ -17,7 +21,7 @@ and only overrides what differs on NPU:
 
 All other handler entry points — ``bind_connector_metadata``,
 ``clear_connector_metadata``, ``start_load_kv``, ``wait_for_save``,
-``get_finished``, ``build_connector_worker_meta``, ``handle_preemptions``,
+``build_connector_worker_meta``, ``handle_preemptions``,
 ``_flush_and_sync_all``, ``_poll_stream_events`` — are inherited
 verbatim.
 """
@@ -71,6 +75,7 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
         # CUDA resource was allocated, so the transient instance is
         # just GC'd.
         self._backend = NPUDmaCopyBackend()
+        self._store_compute_done: torch.npu.Event | None = None
 
     def register_kv_caches(
         self,
@@ -156,6 +161,63 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
             self.load_stream,
             self.store_stream,
         )
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Submit transfers and report completed events to the scheduler.
+
+        NPU->CPU stores read live KV cache tensors. Under overlapped v1
+        execution, the compute stream may still be writing them when
+        get_finished() submits the transfer, so stores wait on a
+        compute-done event recorded on the current NPU stream. CPU->NPU
+        loads read stable host memory and can launch immediately.
+        """
+        metadata = self._connector_metadata
+        if metadata is not None:
+            if metadata.load_cpu_blocks:
+                self._backend.launch_copy(
+                    metadata.load_cpu_blocks,
+                    metadata.load_gpu_blocks,
+                    is_store=False,
+                    event_idx=metadata.load_event,
+                    events_list=self._load_events,
+                )
+            if metadata.store_gpu_blocks:
+                if self._store_compute_done is None:
+                    self._store_compute_done = torch.npu.Event()
+                self._store_compute_done.record(torch.npu.current_stream())
+                self._backend.launch_copy(
+                    metadata.store_gpu_blocks,
+                    metadata.store_cpu_blocks,
+                    is_store=True,
+                    event_idx=metadata.store_event,
+                    events_list=self._store_events,
+                    wait_event=self._store_compute_done,
+                )
+
+        finished_recving: set[str] = set()
+
+        if self._pending_load_event_indices:
+            load_wm = self._poll_stream_events(is_store=False)
+            for event_idx in [i for i in self._pending_load_event_indices if i <= load_wm]:
+                self._pending_load_event_indices.discard(event_idx)
+                req_ids = (
+                    metadata.load_event_to_reqs.get(event_idx)
+                    if metadata is not None
+                    else None
+                )
+                if req_ids:
+                    finished_recving.update(req_ids)
+
+        if self._pending_store_event_indices:
+            store_wm = self._poll_stream_events(is_store=True)
+            for event_idx in [i for i in self._pending_store_event_indices if i <= store_wm]:
+                self._pending_store_event_indices.discard(event_idx)
+                self._completed_store_events[event_idx] = 1
+
+        return None, finished_recving or None
 
     @staticmethod
     def _build_block_views(
