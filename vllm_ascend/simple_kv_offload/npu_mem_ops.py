@@ -2,8 +2,9 @@
 
 Mirrors :mod:`vllm.v1.simple_kv_offload.cuda_mem_ops` but uses the
 Ascend ``aclrtMemcpyBatchAsync`` path exposed via
-``torch.ops._C_ascend.swap_blocks_batch`` (see
-``csrc/torch_binding.cpp``).
+``torch.ops._C_ascend.swap_blocks_batch_indexed`` (see
+``csrc/torch_binding.cpp``). Python submits cached tensor descriptors and
+block ids; native code expands per-block copy addresses.
 """
 
 from __future__ import annotations
@@ -21,67 +22,40 @@ DIRECTION_D2H = 1
 class BatchMemcpyParams(NamedTuple):
     """Pre-computed per-tensor descriptors for batched block copy."""
 
-    src_bases: np.ndarray  # [num_sub_tensors] int64 — data_ptr per tensor
-    dst_bases: np.ndarray  # [num_sub_tensors] int64
-    bpb: np.ndarray  # [num_sub_tensors] int64 — bytes per block
-    src_block_ptrs: np.ndarray  # [num_sub_tensors, src_blocks] int64
-    dst_block_ptrs: np.ndarray  # [num_sub_tensors, dst_blocks] int64
+    src_bases_tensor: torch.Tensor  # [num_sub_tensors] int64
+    dst_bases_tensor: torch.Tensor  # [num_sub_tensors] int64
+    bpb_tensor: torch.Tensor  # [num_sub_tensors] int64
     num_sub_tensors: int
     direction: int  # DIRECTION_H2D or DIRECTION_D2H
 
 
-class BatchMemcpyWorkspace:
-    """Reusable host-side arrays for one batched memcpy submission."""
+class BlockIdWorkspace:
+    """Reusable host-side block-id arrays for one memcpy submission."""
 
     def __init__(self) -> None:
         self._block_capacity = 0
-        self._copy_capacity = 0
         self.src_ids = np.empty(0, dtype=np.int64)
         self.dst_ids = np.empty(0, dtype=np.int64)
-        self.src_ptrs = np.empty(0, dtype=np.int64)
-        self.dst_ptrs = np.empty(0, dtype=np.int64)
-        self.sizes = np.empty(0, dtype=np.int64)
-        self.src_tensor = torch.from_numpy(self.src_ptrs)
-        self.dst_tensor = torch.from_numpy(self.dst_ptrs)
-        self.size_tensor = torch.from_numpy(self.sizes)
+        self.src_tensor = torch.from_numpy(self.src_ids)
+        self.dst_tensor = torch.from_numpy(self.dst_ids)
 
-    def ensure_capacity(self, num_blocks: int, num_copies: int) -> None:
+    def ensure_capacity(self, num_blocks: int) -> None:
         if num_blocks > self._block_capacity:
             self.src_ids = np.empty(num_blocks, dtype=np.int64)
             self.dst_ids = np.empty(num_blocks, dtype=np.int64)
+            self.src_tensor = torch.from_numpy(self.src_ids)
+            self.dst_tensor = torch.from_numpy(self.dst_ids)
             self._block_capacity = num_blocks
 
-        if num_copies > self._copy_capacity:
-            self.src_ptrs = np.empty(num_copies, dtype=np.int64)
-            self.dst_ptrs = np.empty(num_copies, dtype=np.int64)
-            self.sizes = np.empty(num_copies, dtype=np.int64)
-            self.src_tensor = torch.from_numpy(self.src_ptrs)
-            self.dst_tensor = torch.from_numpy(self.dst_ptrs)
-            self.size_tensor = torch.from_numpy(self.sizes)
-            self._copy_capacity = num_copies
-
-    def tensors(self, num_copies: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if num_copies == self._copy_capacity:
-            return self.src_tensor, self.dst_tensor, self.size_tensor
-        return (
-            self.src_tensor[:num_copies],
-            self.dst_tensor[:num_copies],
-            self.size_tensor[:num_copies],
-        )
+    def tensors(self, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_blocks == self._block_capacity:
+            return self.src_tensor, self.dst_tensor
+        return self.src_tensor[:num_blocks], self.dst_tensor[:num_blocks]
 
 
 def _ordered_tensors(caches: dict[str, torch.Tensor]) -> list[torch.Tensor]:
     """Return values in insertion order (kept as a function for clarity)."""
     return list(caches.values())
-
-
-def _block_ptr_table(
-    bases: np.ndarray,
-    bpb: np.ndarray,
-    num_blocks: int,
-) -> np.ndarray:
-    block_ids = np.arange(num_blocks, dtype=np.int64)
-    return bases[:, None] + block_ids[None, :] * bpb[:, None]
 
 
 def build_params(
@@ -118,11 +92,9 @@ def build_params(
     dst_base_array = np.array(dst_bases, dtype=np.int64)
     bpb_array = np.array(bpb, dtype=np.int64)
     return BatchMemcpyParams(
-        src_bases=src_base_array,
-        dst_bases=dst_base_array,
-        bpb=bpb_array,
-        src_block_ptrs=_block_ptr_table(src_base_array, bpb_array, src_num_blocks),
-        dst_block_ptrs=_block_ptr_table(dst_base_array, bpb_array, dst_num_blocks),
+        src_bases_tensor=torch.from_numpy(src_base_array),
+        dst_bases_tensor=torch.from_numpy(dst_base_array),
+        bpb_tensor=torch.from_numpy(bpb_array),
         num_sub_tensors=len(src_tensors),
         direction=direction,
     )
@@ -132,7 +104,7 @@ def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
-    workspace: BatchMemcpyWorkspace | None = None,
+    workspace: BlockIdWorkspace | None = None,
 ) -> None:
     """Issue a batched async DMA on the *current* NPU stream.
 
@@ -144,26 +116,21 @@ def copy_blocks(
         return
     assert n == len(dst_block_ids), "src/dst block counts must match"
 
-    total_copies = params.num_sub_tensors * n
     if workspace is None:
-        workspace = BatchMemcpyWorkspace()
-    workspace.ensure_capacity(n, total_copies)
+        workspace = BlockIdWorkspace()
+    workspace.ensure_capacity(n)
 
     src_ids = workspace.src_ids[:n]
     dst_ids = workspace.dst_ids[:n]
     src_ids[:] = src_block_ids
     dst_ids[:] = dst_block_ids
+    src_id_tensor, dst_id_tensor = workspace.tensors(n)
 
-    # Layout: (num_sub_tensors, n) flattened, matching swap_blocks_batch.
-    shape = (params.num_sub_tensors, n)
-    src_matrix = workspace.src_ptrs[:total_copies].reshape(shape)
-    dst_matrix = workspace.dst_ptrs[:total_copies].reshape(shape)
-    size_matrix = workspace.sizes[:total_copies].reshape(shape)
-    bpb_col = params.bpb[:, None]
-    np.take(params.src_block_ptrs, src_ids, axis=1, out=src_matrix)
-    np.take(params.dst_block_ptrs, dst_ids, axis=1, out=dst_matrix)
-    size_matrix[...] = bpb_col
-
-    batch_src, batch_dst, batch_sizes = workspace.tensors(total_copies)
-
-    torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, params.direction)
+    torch.ops._C_ascend.swap_blocks_batch_indexed(
+        params.src_bases_tensor,
+        params.dst_bases_tensor,
+        params.bpb_tensor,
+        src_id_tensor,
+        dst_id_tensor,
+        params.direction,
+    )

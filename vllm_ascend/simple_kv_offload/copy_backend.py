@@ -16,7 +16,7 @@ from vllm_ascend.simple_kv_offload.npu_mem_ops import (
     DIRECTION_D2H,
     DIRECTION_H2D,
     BatchMemcpyParams,
-    BatchMemcpyWorkspace,
+    BlockIdWorkspace,
     build_params,
     copy_blocks,
 )
@@ -41,7 +41,7 @@ class NPUDmaCopyBackend:
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
-        self._workspace = BatchMemcpyWorkspace()
+        self._workspace = BlockIdWorkspace()
         self._event_pool: list[torch.npu.Event] = []
         self._event_pool_lock = threading.Lock()
 

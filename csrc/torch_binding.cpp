@@ -18,6 +18,7 @@
 #include <torch/library.h>
 #include <torch/version.h>
 #include <torch/torch.h>
+#include <limits>
 #include <ATen/core/Formatting.h>
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
@@ -123,27 +124,12 @@ void enqueue_device_print(std::unique_ptr<DevicePrintPayload> payload,
 
 }
 
-void swap_blocks_batch(const torch::Tensor& src_ptrs,
-                       const torch::Tensor& dst_ptrs,
-                       const torch::Tensor& sizes,
-                       int64_t direction) {
-
-    TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
-    TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
-    TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
-    TORCH_CHECK(src_ptrs.dtype() == torch::kInt64, "src_ptrs must be int64");
-    TORCH_CHECK(dst_ptrs.dtype() == torch::kInt64, "dst_ptrs must be int64");
-    TORCH_CHECK(sizes.dtype() == torch::kInt64, "sizes must be int64");
-
-    const int64_t n = src_ptrs.size(0);
-    TORCH_CHECK(dst_ptrs.size(0) == n, "dst_ptrs length must match src_ptrs");
-    TORCH_CHECK(sizes.size(0) == n, "sizes length must match src_ptrs");
-
+void swap_blocks_batch_impl(const int64_t* src_data,
+                            const int64_t* dst_data,
+                            const int64_t* size_data,
+                            int64_t n,
+                            int64_t direction) {
     if (n == 0) return;
-
-    const int64_t* src_data = src_ptrs.data_ptr<int64_t>();
-    const int64_t* dst_data = dst_ptrs.data_ptr<int64_t>();
-    const int64_t* size_data = sizes.data_ptr<int64_t>();
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
@@ -243,6 +229,102 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
                     ", dst=", dst_data[i],
                     ", size=", size_data[i]);
     }
+}
+
+void swap_blocks_batch(const torch::Tensor& src_ptrs,
+                       const torch::Tensor& dst_ptrs,
+                       const torch::Tensor& sizes,
+                       int64_t direction) {
+    TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
+    TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
+    TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
+    TORCH_CHECK(src_ptrs.dtype() == torch::kInt64, "src_ptrs must be int64");
+    TORCH_CHECK(dst_ptrs.dtype() == torch::kInt64, "dst_ptrs must be int64");
+    TORCH_CHECK(sizes.dtype() == torch::kInt64, "sizes must be int64");
+
+    const int64_t n = src_ptrs.size(0);
+    TORCH_CHECK(dst_ptrs.size(0) == n, "dst_ptrs length must match src_ptrs");
+    TORCH_CHECK(sizes.size(0) == n, "sizes length must match src_ptrs");
+
+    swap_blocks_batch_impl(src_ptrs.data_ptr<int64_t>(),
+                           dst_ptrs.data_ptr<int64_t>(),
+                           sizes.data_ptr<int64_t>(),
+                           n,
+                           direction);
+}
+
+void swap_blocks_batch_indexed(const torch::Tensor& src_bases,
+                               const torch::Tensor& dst_bases,
+                               const torch::Tensor& sizes,
+                               const torch::Tensor& src_block_ids,
+                               const torch::Tensor& dst_block_ids,
+                               int64_t direction) {
+    TORCH_CHECK(src_bases.device().is_cpu(), "src_bases must be on CPU");
+    TORCH_CHECK(dst_bases.device().is_cpu(), "dst_bases must be on CPU");
+    TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
+    TORCH_CHECK(src_block_ids.device().is_cpu(), "src_block_ids must be on CPU");
+    TORCH_CHECK(dst_block_ids.device().is_cpu(), "dst_block_ids must be on CPU");
+    TORCH_CHECK(src_bases.dtype() == torch::kInt64, "src_bases must be int64");
+    TORCH_CHECK(dst_bases.dtype() == torch::kInt64, "dst_bases must be int64");
+    TORCH_CHECK(sizes.dtype() == torch::kInt64, "sizes must be int64");
+    TORCH_CHECK(src_block_ids.dtype() == torch::kInt64, "src_block_ids must be int64");
+    TORCH_CHECK(dst_block_ids.dtype() == torch::kInt64, "dst_block_ids must be int64");
+    TORCH_CHECK(src_bases.dim() == 1, "src_bases must be 1D");
+    TORCH_CHECK(dst_bases.dim() == 1, "dst_bases must be 1D");
+    TORCH_CHECK(sizes.dim() == 1, "sizes must be 1D");
+    TORCH_CHECK(src_block_ids.dim() == 1, "src_block_ids must be 1D");
+    TORCH_CHECK(dst_block_ids.dim() == 1, "dst_block_ids must be 1D");
+    TORCH_CHECK(src_bases.is_contiguous(), "src_bases must be contiguous");
+    TORCH_CHECK(dst_bases.is_contiguous(), "dst_bases must be contiguous");
+    TORCH_CHECK(sizes.is_contiguous(), "sizes must be contiguous");
+    TORCH_CHECK(src_block_ids.is_contiguous(), "src_block_ids must be contiguous");
+    TORCH_CHECK(dst_block_ids.is_contiguous(), "dst_block_ids must be contiguous");
+
+    const int64_t num_sub_tensors = sizes.size(0);
+    const int64_t num_blocks = src_block_ids.size(0);
+    TORCH_CHECK(src_bases.size(0) == num_sub_tensors,
+                "src_bases length must match sizes");
+    TORCH_CHECK(dst_bases.size(0) == num_sub_tensors,
+                "dst_bases length must match sizes");
+    TORCH_CHECK(dst_block_ids.size(0) == num_blocks,
+                "dst_block_ids length must match src_block_ids");
+    if (num_sub_tensors == 0 || num_blocks == 0) return;
+
+    TORCH_CHECK(num_sub_tensors <= std::numeric_limits<int64_t>::max() / num_blocks,
+                "indexed batch size overflow");
+    const int64_t total = num_sub_tensors * num_blocks;
+
+    thread_local std::vector<int64_t> src_ptrs;
+    thread_local std::vector<int64_t> dst_ptrs;
+    thread_local std::vector<int64_t> copy_sizes;
+    src_ptrs.resize(static_cast<size_t>(total));
+    dst_ptrs.resize(static_cast<size_t>(total));
+    copy_sizes.resize(static_cast<size_t>(total));
+
+    const int64_t* src_bases_data = src_bases.data_ptr<int64_t>();
+    const int64_t* dst_bases_data = dst_bases.data_ptr<int64_t>();
+    const int64_t* sizes_data = sizes.data_ptr<int64_t>();
+    const int64_t* src_block_data = src_block_ids.data_ptr<int64_t>();
+    const int64_t* dst_block_data = dst_block_ids.data_ptr<int64_t>();
+
+    for (int64_t tensor_idx = 0; tensor_idx < num_sub_tensors; ++tensor_idx) {
+        const int64_t copy_size = sizes_data[tensor_idx];
+        const int64_t src_base = src_bases_data[tensor_idx];
+        const int64_t dst_base = dst_bases_data[tensor_idx];
+        const int64_t row_offset = tensor_idx * num_blocks;
+        for (int64_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+            const int64_t offset = row_offset + block_idx;
+            src_ptrs[offset] = src_base + src_block_data[block_idx] * copy_size;
+            dst_ptrs[offset] = dst_base + dst_block_data[block_idx] * copy_size;
+            copy_sizes[offset] = copy_size;
+        }
+    }
+
+    swap_blocks_batch_impl(src_ptrs.data(),
+                           dst_ptrs.data(),
+                           copy_sizes.data(),
+                           total,
+                           direction);
 }
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
@@ -2333,6 +2415,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // internally submits async memcpy on the current NPU stream.
     ops.def("swap_blocks_batch(Tensor x, Tensor y, Tensor z, int direction) -> ()");
     ops.impl("swap_blocks_batch", torch::kCPU, &vllm_ascend::swap_blocks_batch);
+    ops.def(
+        "swap_blocks_batch_indexed(Tensor src_bases, Tensor dst_bases, Tensor sizes,"
+        " Tensor src_block_ids, Tensor dst_block_ids, int direction) -> ()");
+    ops.impl("swap_blocks_batch_indexed", torch::kCPU,
+             &vllm_ascend::swap_blocks_batch_indexed);
     ops.def("device_print(str msg) -> ()");
     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));

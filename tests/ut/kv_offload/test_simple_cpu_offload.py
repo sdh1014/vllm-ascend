@@ -5,7 +5,7 @@ import torch
 
 from vllm_ascend.simple_kv_offload.npu_mem_ops import (
     DIRECTION_D2H,
-    BatchMemcpyWorkspace,
+    BlockIdWorkspace,
     build_params,
     copy_blocks,
 )
@@ -69,34 +69,70 @@ def test_npu_worker_recycles_completed_transfer_events():
 
 
 def test_copy_blocks_reuses_workspace_tensors(monkeypatch):
-    captured: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+    captured: list[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            int,
+        ]
+    ] = []
 
-    def fake_swap_blocks_batch(
-        src: torch.Tensor,
-        dst: torch.Tensor,
+    def fake_swap_blocks_batch_indexed(
+        src_bases: torch.Tensor,
+        dst_bases: torch.Tensor,
         sizes: torch.Tensor,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
         direction: int,
     ) -> None:
-        captured.append((src, dst, sizes, direction))
+        captured.append(
+            (
+                src_bases,
+                dst_bases,
+                sizes,
+                src_block_ids,
+                dst_block_ids,
+                direction,
+            )
+        )
 
     monkeypatch.setattr(
         torch.ops._C_ascend,
-        "swap_blocks_batch",
-        fake_swap_blocks_batch,
+        "swap_blocks_batch_indexed",
+        fake_swap_blocks_batch_indexed,
         raising=False,
     )
 
     src_caches = {f"t{i}": torch.empty((8, 16), dtype=torch.uint8) for i in range(2)}
     dst_caches = {f"t{i}": torch.empty((8, 16), dtype=torch.uint8) for i in range(2)}
     params = build_params(src_caches, dst_caches, DIRECTION_D2H)
-    workspace = BatchMemcpyWorkspace()
+    workspace = BlockIdWorkspace()
 
     copy_blocks([0, 1], [2, 3], params, workspace)
-    first_src, first_dst, first_sizes, first_direction = captured[-1]
+    (
+        first_src_bases,
+        first_dst_bases,
+        first_sizes,
+        first_src_ids,
+        first_dst_ids,
+        first_direction,
+    ) = captured[-1]
     copy_blocks([1, 2], [3, 4], params, workspace)
-    second_src, second_dst, second_sizes, second_direction = captured[-1]
+    (
+        second_src_bases,
+        second_dst_bases,
+        second_sizes,
+        second_src_ids,
+        second_dst_ids,
+        second_direction,
+    ) = captured[-1]
 
     assert first_direction == second_direction == DIRECTION_D2H
-    assert first_src.data_ptr() == second_src.data_ptr()
-    assert first_dst.data_ptr() == second_dst.data_ptr()
+    assert first_src_bases.data_ptr() == second_src_bases.data_ptr()
+    assert first_dst_bases.data_ptr() == second_dst_bases.data_ptr()
     assert first_sizes.data_ptr() == second_sizes.data_ptr()
+    assert first_src_ids.data_ptr() == second_src_ids.data_ptr()
+    assert first_dst_ids.data_ptr() == second_dst_ids.data_ptr()
