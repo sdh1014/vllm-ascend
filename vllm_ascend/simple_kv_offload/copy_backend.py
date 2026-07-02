@@ -16,6 +16,7 @@ from vllm_ascend.simple_kv_offload.npu_mem_ops import (
     DIRECTION_D2H,
     DIRECTION_H2D,
     BatchMemcpyParams,
+    BatchMemcpyWorkspace,
     build_params,
     copy_blocks,
 )
@@ -40,6 +41,9 @@ class NPUDmaCopyBackend:
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
+        self._workspace = BatchMemcpyWorkspace()
+        self._event_pool: list[torch.npu.Event] = []
+        self._event_pool_lock = threading.Lock()
 
     def init(
         self,
@@ -96,6 +100,18 @@ class NPUDmaCopyBackend:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
 
+    def recycle_event(self, event: torch.npu.Event) -> None:
+        if self._shutdown:
+            return
+        with self._event_pool_lock:
+            self._event_pool.append(event)
+
+    def _get_event(self) -> torch.npu.Event:
+        with self._event_pool_lock:
+            if self._event_pool:
+                return self._event_pool.pop()
+        return torch.npu.Event()
+
     # ------------------------------------------------------------------
     # Worker thread main loop
     # ------------------------------------------------------------------
@@ -132,7 +148,7 @@ class NPUDmaCopyBackend:
             with torch.npu.stream(stream):
                 if wait_event is not None:
                     stream.wait_event(wait_event)
-                copy_blocks(src_blocks, dst_blocks, params)
-                event = torch.npu.Event()
+                copy_blocks(src_blocks, dst_blocks, params, self._workspace)
+                event = self._get_event()
                 event.record(stream)
             events_list.append((event_idx, event))

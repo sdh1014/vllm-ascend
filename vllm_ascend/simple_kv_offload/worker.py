@@ -21,8 +21,7 @@ and only overrides what differs on NPU:
 
 All other handler entry points — ``bind_connector_metadata``,
 ``clear_connector_metadata``, ``start_load_kv``, ``wait_for_save``,
-``build_connector_worker_meta``, ``handle_preemptions``,
-``_flush_and_sync_all``, ``_poll_stream_events`` — are inherited
+``build_connector_worker_meta``, ``handle_preemptions`` — are inherited
 verbatim.
 """
 
@@ -218,6 +217,37 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
                 self._completed_store_events[event_idx] = 1
 
         return None, finished_recving or None
+
+    def _flush_and_sync_all(self) -> None:
+        """Synchronize in-flight transfers and recycle completed events."""
+        for event_idx, event in self._load_events:
+            event.synchronize()
+            self._load_hwm = event_idx
+            self._backend.recycle_event(event)
+        self._load_events.clear()
+
+        for event_idx, event in self._store_events:
+            event.synchronize()
+            self._store_hwm = event_idx
+            self._backend.recycle_event(event)
+        self._store_events.clear()
+
+    def _poll_stream_events(self, is_store: bool) -> int:
+        """Non-blocking poll for completed events and return high-water mark."""
+        events = self._store_events if is_store else self._load_events
+        hwm = self._store_hwm if is_store else self._load_hwm
+        while events:
+            event_idx, event = events[0]
+            if not event.query():
+                break
+            hwm = event_idx
+            events.pop(0)
+            self._backend.recycle_event(event)
+        if is_store:
+            self._store_hwm = hwm
+        else:
+            self._load_hwm = hwm
+        return hwm
 
     @staticmethod
     def _build_block_views(
